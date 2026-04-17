@@ -1,0 +1,358 @@
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: ./infra/nginx/Dockerfile
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT}:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      auth-svc:
+        condition: service_started
+      chat-svc:
+        condition: service_started
+      library-svc:
+        condition: service_started
+    networks:
+      - app-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - app-network
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      - ollama
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      ollama pull mistral
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - app-network
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Copenhagen
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+
+      AUTH_DB_USER: ${AUTH_DB_USER}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD}
+
+      CHAT_DB_USER: ${CHAT_DB_USER}
+      CHAT_DB_PASSWORD: ${CHAT_DB_PASSWORD}
+
+      LIBRARY_DB_USER: ${LIBRARY_DB_USER}
+      LIBRARY_DB_PASSWORD: ${LIBRARY_DB_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - app-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_REGION_NAME: ${MINIO_REGION}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - app-network
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} &&
+      mc mb -p local/${MINIO_BUCKET} || true &&
+      mc anonymous set none local/${MINIO_BUCKET} || true
+      "
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  embedding-svc:
+    build:
+      context: ./services/embedding-svc
+      dockerfile: Dockerfile
+    container_name: embedding-svc
+    restart: unless-stopped
+    ports:
+      - "${EMBEDDING_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/embedding-svc/.env
+    environment:
+      EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - app-network
+
+  auth-svc:
+    build:
+      context: ./services/auth-svc
+      dockerfile: Dockerfile
+    container_name: auth-svc
+    restart: unless-stopped
+    ports:
+      - "${AUTH_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/auth-svc/.env
+    environment:
+      PORT: ${AUTH_INTERNAL_PORT}
+      DATABASE_URL: ${AUTH_DATABASE_URL}
+      REDIS_URL: redis://${REDIS_HOST}:6379/0
+    volumes:
+      - ./services/auth-svc:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  library-svc:
+    build:
+      context: ./services/library-svc
+      dockerfile: Dockerfile
+    container_name: library-svc
+    restart: unless-stopped
+    ports:
+      - "${LIBRARY_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/library-svc/.env
+    environment:
+      POSTGRES_USER: ${LIBRARY_DB_USER}
+      POSTGRES_PASSWORD: ${LIBRARY_DB_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DATABASE_URL: ${LIBRARY_DATABASE_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_REGION: ${MINIO_REGION}
+      MINIO_SECURE: ${MINIO_SECURE}
+    volumes:
+      - ./services/library-svc:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  chat-svc:
+    build:
+      context: ./services/chat-svc
+      dockerfile: Dockerfile
+    container_name: chat-svc
+    restart: unless-stopped
+    ports:
+      - "${CHAT_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/chat-svc/.env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      POSTGRES_URL: ${CHAT_DATABASE_URL}
+      REDIS_URL: redis://${REDIS_HOST}:6379/0
+      REDIS_CHANNEL: ws:broadcast
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  rag-svc:
+    build:
+      context: ./services/rag-svc
+      dockerfile: Dockerfile
+    container_name: rag-svc
+    restart: unless-stopped
+    ports:
+      - "${RAG_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/rag-svc/.env
+    environment:
+      DATABASE_URL: ${RAG_DATABASE_URL}
+      EMBEDDER_NAME: ${EMBEDDER_MODEL_NAME}
+    volumes:
+      - ./services/rag-svc:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      embedding-svc:
+        condition: service_started
+    networks:
+      - app-network
+  
+  llm-svc:
+    build:
+      context: ./services/llm-svc
+      dockerfile: Dockerfile
+    container_name: llm-svc
+    restart: unless-stopped
+    ports:
+      - "${LLM_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/llm-svc/.env
+    environment:
+      DATABASE_URL: ${LLM_DATABASE_URL}
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/huggingface
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+
+    volumes:
+      - llm_hf_cache:/app/.cache/huggingface
+      - pip_cache:/root/.cache/pip
+    depends_on:
+      rag-svc:
+        condition: service_started
+      chat-svc:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  ingest-worker:
+    build:
+      context: ./services/ingest-worker
+      dockerfile: Dockerfile
+    container_name: ingest-worker
+    restart: unless-stopped
+    ports:
+      - "${INGESTWORKER_PUBLIC_PORT}:8000"
+    env_file:
+      - ./services/ingest-worker/.env
+    environment:
+      DATABASE_URL: ${INGESTWOKRER_DATABASE_URL}
+    volumes:
+      - ./services/ingest-worker:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      embedding-svc:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  db-svc:
+    build: ./services/db-svc
+    container_name: db-svc
+    env_file:
+      - ./services/db-svc/.env
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_REGION: ${MINIO_REGION}
+      MINIO_SECURE: ${MINIO_SECURE}
+
+      DBSVC_ADMIN_TOKEN: ${DBSVC_ADMIN_TOKEN}
+    ports:
+      - "${DBSVC_PUBLIC_PORT}:8000"
+    depends_on:
+      - postgres
+      - minio
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+  hf_cache:
+  llm_hf_cache:
+  ollama_data:
+  pip_cache:
+
+networks:
+  app-network:
+    driver: bridge
