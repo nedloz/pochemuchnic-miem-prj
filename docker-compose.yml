@@ -1,31 +1,32 @@
 services:
-  nginx:
-    build:
-      context: .
-      dockerfile: ./infra/nginx/Dockerfile
-    container_name: nginx
-    restart: unless-stopped
-    ports:
-      - "${NGINX_PORT}:80"
-    volumes:
-      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      auth-svc:
-        condition: service_started
-      chat-svc:
-        condition: service_started
-      library-svc:
-        condition: service_started
-    networks:
-      - app-network
-
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
-    ports:
-      - "11434:11434"
+    restart: unless-stopped
+    # Профиль `llm` — потому что резервация GPU ниже делает контейнер незапускаемым на машине
+    # без nvidia container toolkit, а `docker compose up` поднимает все сервисы разом: без
+    # профиля такая машина не смогла бы поднять вообще ничего. Включается через
+    # COMPOSE_PROFILES=llm в main/.env (там же объяснено, когда её убирать).
+    profiles: ["llm"]
+    # Только петлевой интерфейс, как у db-svc/graph-rag-svc/embedding-svc: у ollama нет
+    # аутентификации, и наружу это открытый доступ к генерации на GPU машины. На связь между
+    # контейнерами публикация портов не влияет вовсе — graph-rag-svc ходит на
+    # http://ollama:11434 внутри сети app-network, минуя хост.
+    # Порт наружу не публикуется: снаружи должен быть виден только nginx.
+    # ports:
+    #   - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
     volumes:
       - ollama_data:/root/.ollama
+    # Проверка готовности, а не факта запуска процесса: `ollama list` отвечает только когда
+    # сервер уже слушает. На неё опирается ollama-init — раньше он вместо этого ждал
+    # фиксированные 5 секунд и на холодном volume или медленной инициализации GPU
+    # успевал сходить в ещё не поднятый сервер.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
     deploy:
       resources:
         reservations:
@@ -36,20 +37,27 @@ services:
     networks:
       - app-network
 
+  # Разовая загрузка модели после старта сервера. Отдельным контейнером, а не хуком
+  # post_start у самой ollama: у хука не гарантировано время выполнения и его падение не
+  # роняет сервис, а завершение init-контейнера — событие в графе зависимостей, на которое
+  # можно повесить condition: service_completed_successfully.
   ollama-init:
     image: ollama/ollama:latest
     container_name: ollama-init
+    profiles: ["llm"]
     depends_on:
-      - ollama
-    entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      ollama pull mistral
-      "
+      ollama:
+        condition: service_healthy
+    # Модель берётся из OLLAMA_MODEL — той же переменной, что уходит в graph-rag-svc.
+    # Раньше здесь было зашито `ollama pull mistral`, и после смены переменной сервис просил
+    # бы модель, которую никто не скачал. $$ — экранирование от подстановки самим compose:
+    # переменная должна раскрыться внутри контейнера.
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$$OLLAMA_MODEL\""]
     environment:
-      - OLLAMA_HOST=http://ollama:11434
-    volumes:
-      - ollama_data:/root/.ollama
+      # OLLAMA_HOST делает CLI чистым HTTP-клиентом: загрузка идёт по сети и ложится в volume
+      # сервера, поэтому монтировать ollama_data сюда не нужно (раньше монтировалось впустую).
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
     networks:
       - app-network
 
@@ -58,47 +66,49 @@ services:
     container_name: postgres
     restart: unless-stopped
     environment:
-      TZ: Europe/Copenhagen
+      TZ: Europe/Moscow
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_ADMIN_USER}
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
-
       AUTH_DB_USER: ${AUTH_DB_USER}
       AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD}
-
       CHAT_DB_USER: ${CHAT_DB_USER}
       CHAT_DB_PASSWORD: ${CHAT_DB_PASSWORD}
-
       LIBRARY_DB_USER: ${LIBRARY_DB_USER}
       LIBRARY_DB_PASSWORD: ${LIBRARY_DB_PASSWORD}
-    ports:
-      - "${POSTGRES_PORT}:5432"
+      # пользователей может быть больше надо перепроверить
+    # Порт наружу не публикуется: наружу должен смотреть только nginx, всё остальное —
+    # только внутри app-network. Для локального psql используйте `docker compose exec postgres psql ...`.
+    # ports:
+    #   - "${POSTGRES_PORT}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - app-network    
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
-    networks:
-      - app-network
+
 
   redis:
     image: redis:7
     container_name: redis
     restart: unless-stopped
-    ports:
-      - "${REDIS_PORT}:6379"
+    # ports:
+    #   - "${REDIS_PORT}:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - app-network
+
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
-    networks:
-      - app-network
 
   minio:
     image: minio/minio:latest
@@ -109,9 +119,11 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
       MINIO_REGION_NAME: ${MINIO_REGION}
     command: server /data --console-address ":9001"
-    ports:
-      - "${MINIO_PORT}:9000"
-      - "${MINIO_CONSOLE_PORT}:9001"
+    # Порты наружу не публикуются: снаружи должен быть виден только nginx. Консоль MinIO
+    # при необходимости — через `docker compose exec` или временный `docker compose port`.
+    # ports:
+    #   - "${MINIO_PORT}:9000"
+    #   - "${MINIO_CONSOLE_PORT}:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -138,16 +150,30 @@ services:
     networks:
       - app-network
 
+  nginx:
+    build:
+      context: .
+      dockerfile: ./infra/nginx/Dockerfile
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT}:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - app-network
+
   embedding-svc:
     build:
-      context: ./services/embedding-svc
+      context: ../services/embedding-svc
       dockerfile: Dockerfile
     container_name: embedding-svc
     restart: unless-stopped
-    ports:
-      - "${EMBEDDING_PUBLIC_PORT}:8000"
+    # Порт наружу не публикуется: снаружи должен быть виден только nginx.
+    # ports:
+    #   - "127.0.0.1:${EMBEDDING_PUBLIC_PORT}:8000"
     env_file:
-      - ./services/embedding-svc/.env
+      - ../services/embedding-svc/.env
     environment:
       EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
     volumes:
@@ -164,38 +190,34 @@ services:
 
   auth-svc:
     build:
-      context: ./services/auth-svc
+      context: ../services/auth-svc
       dockerfile: Dockerfile
     container_name: auth-svc
     restart: unless-stopped
-    ports:
-      - "${AUTH_PUBLIC_PORT}:8000"
+    # ports:
+    #   - "${AUTH_PUBLIC_PORT}:8000"
     env_file:
-      - ./services/auth-svc/.env
+      - ../services/auth-svc/.env
     environment:
-      PORT: ${AUTH_INTERNAL_PORT}
+      # PORT здесь не задаём: порт зашит в CMD Dockerfile'а (8000), а переменная
+      # AUTH_INTERNAL_PORT нигде не определена — compose ругался на пустое значение.
       DATABASE_URL: ${AUTH_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
     volumes:
-      - ./services/auth-svc:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - ../services/auth-svc:/app
     networks:
       - app-network
 
   library-svc:
     build:
-      context: ./services/library-svc
+      context: ../services/library-svc
       dockerfile: Dockerfile
     container_name: library-svc
     restart: unless-stopped
-    ports:
-      - "${LIBRARY_PUBLIC_PORT}:8000"
+    # Порт намеренно не публикуется: у сервиса нет собственной аутентификации, и снаружи
+    # он должен быть доступен только через nginx, который проверяет JWT (auth_request).
     env_file:
-      - ./services/library-svc/.env
+      - ../services/library-svc/.env
     environment:
       POSTGRES_USER: ${LIBRARY_DB_USER}
       POSTGRES_PASSWORD: ${LIBRARY_DB_PASSWORD}
@@ -208,118 +230,102 @@ services:
       MINIO_REGION: ${MINIO_REGION}
       MINIO_SECURE: ${MINIO_SECURE}
     volumes:
-      - ./services/library-svc:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - ../services/library-svc:/app
     networks:
       - app-network
 
   chat-svc:
     build:
-      context: ./services/chat-svc
+      context: ../services/chat-svc
       dockerfile: Dockerfile
     container_name: chat-svc
     restart: unless-stopped
-    ports:
-      - "${CHAT_PUBLIC_PORT}:8000"
+    # Порт намеренно не публикуется. chat-svc не проверяет JWT сам — он доверяет заголовку
+    # X-User-Id, который проставляет nginx после auth_request. Прямой доступ к контейнеру
+    # позволил бы подделать этот заголовок и войти в любую чужую сессию.
     env_file:
-      - ./services/chat-svc/.env
+      - ../services/chat-svc/.env
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 8000
       POSTGRES_URL: ${CHAT_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
       REDIS_CHANNEL: ws:broadcast
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     networks:
       - app-network
 
-  rag-svc:
+  graph-rag-svc:
     build:
-      context: ./services/rag-svc
+      context: ../services/graph-rag-svc
       dockerfile: Dockerfile
-    container_name: rag-svc
+      args:
+        # Ставить torch/transformers/accelerate в образ (~5 ГБ) или нет. Нужны только
+        # провайдеру LLM_PROVIDER=local, который в прод-среде использоваться не должен.
+        WITH_LOCAL_LLM: "${GRAPH_RAG_WITH_LOCAL_LLM:-false}"
+    container_name: graph-rag-svc
     restart: unless-stopped
-    ports:
-      - "${RAG_PUBLIC_PORT}:8000"
+    # Порт наружу не публикуется: снаружи должен быть виден только nginx.
+    # ports:
+    #   - "127.0.0.1:${GRAPH_RAG_PUBLIC_PORT}:8000"
     env_file:
-      - ./services/rag-svc/.env
+      - ../services/graph-rag-svc/.env
     environment:
-      DATABASE_URL: ${RAG_DATABASE_URL}
-      EMBEDDER_NAME: ${EMBEDDER_MODEL_NAME}
+      DATABASE_URL: ${GRAPH_RAG_DATABASE_URL}
+      EMBEDDING_SVC_URL: http://embedding-svc:8000
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/huggingface
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
     volumes:
-      - ./services/rag-svc:/app
+      - graph_rag_hf_cache:/app/.cache/huggingface
+      - pip_cache:/root/.cache/pip
     depends_on:
       postgres:
         condition: service_healthy
       embedding-svc:
         condition: service_started
-    networks:
-      - app-network
-  
-  llm-svc:
-    build:
-      context: ./services/llm-svc
-      dockerfile: Dockerfile
-    container_name: llm-svc
-    restart: unless-stopped
-    ports:
-      - "${LLM_PUBLIC_PORT}:8000"
-    env_file:
-      - ./services/llm-svc/.env
-    environment:
-      DATABASE_URL: ${LLM_DATABASE_URL}
-      HF_HOME: /app/.cache/huggingface
-      TRANSFORMERS_CACHE: /app/.cache/huggingface
-      OLLAMA_MODEL: ${OLLAMA_MODEL}
-
-    volumes:
-      - llm_hf_cache:/app/.cache/huggingface
-      - pip_cache:/root/.cache/pip
-    depends_on:
-      rag-svc:
-        condition: service_started
-      chat-svc:
-        condition: service_started
-      ollama:
-        condition: service_healthy
     networks:
       - app-network
 
   ingest-worker:
     build:
-      context: ./services/ingest-worker
+      context: ../services/ingest-worker
       dockerfile: Dockerfile
     container_name: ingest-worker
     restart: unless-stopped
-    ports:
-      - "${INGESTWORKER_PUBLIC_PORT}:8000"
+    # Порт не публикуется: это background worker без HTTP-сервера.
     env_file:
-      - ./services/ingest-worker/.env
+      - ../services/ingest-worker/.env
     environment:
       DATABASE_URL: ${INGESTWOKRER_DATABASE_URL}
+      EMBEDDING_SVC_URL: http://embedding-svc:8000
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      # Воркер читает S3_*, а не MINIO_*, как остальные сервисы. Значения берём из тех же
+      # переменных, чтобы адрес хранилища оставался в одном месте. Без этого блока он
+      # молча падал на умолчании http://localhost:9000 — внутри контейнера это он сам.
+      # MINIO_ENDPOINT задаётся без схемы (host:port), поэтому http:// добавляем здесь.
+      S3_ENDPOINT: http://${MINIO_ENDPOINT}
+      S3_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      S3_SECRET_KEY: ${MINIO_SECRET_KEY}
     volumes:
-      - ./services/ingest-worker:/app
+      - ../services/ingest-worker:/app
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
-        condition: service_healthy
       embedding-svc:
+        condition: service_started
+      minio:
         condition: service_healthy
     networks:
       - app-network
 
   db-svc:
-    build: ./services/db-svc
+    build: 
+      context: ../services/db-svc
+      dockerfile: Dockerfile
     container_name: db-svc
     env_file:
-      - ./services/db-svc/.env
+      - ../services/db-svc/.env
     environment:
       POSTGRES_USER: ${POSTGRES_ADMIN_USER}
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
@@ -335,11 +341,16 @@ services:
       MINIO_SECURE: ${MINIO_SECURE}
 
       DBSVC_ADMIN_TOKEN: ${DBSVC_ADMIN_TOKEN}
-    ports:
-      - "${DBSVC_PUBLIC_PORT}:8000"
+      GRAPH_RAG_URL: http://graph-rag-svc:8000
+    # Без ожидания готовности базы сервис успевал стартовать раньше postgres, получал
+    # "Connection refused" и продолжал работу без таблицы журнала задач: импорт падал
+    # пятисоткой уже в интерфейсе, а причина оставалась в первых строках лога.
     depends_on:
-      - postgres
-      - minio
+      postgres:
+        condition: service_healthy
+    # Порт наружу не публикуется: снаружи должен быть виден только nginx.
+    # ports:
+    #   - "127.0.0.1:${DBSVC_PUBLIC_PORT}:8000"
     restart: unless-stopped
     networks:
       - app-network
@@ -349,7 +360,7 @@ volumes:
   redis_data:
   minio_data:
   hf_cache:
-  llm_hf_cache:
+  graph_rag_hf_cache:
   ollama_data:
   pip_cache:
 
