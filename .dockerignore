@@ -1,0 +1,16 @@
+# Контекст сборки nginx — весь каталог main/, поэтому исключаем всё, что в образ не нужно.
+# Особенно важно для frontend/node_modules: после локального `pnpm install` он весит сотни
+# мегабайт и иначе целиком уезжал бы в контекст при каждой сборке.
+
+.git
+**/.git
+
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+tests
+infra/db
+*.md
+.env
+.env.example

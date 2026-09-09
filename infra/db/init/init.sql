@@ -25,6 +25,28 @@
 \set chat_user      chat_user
 \set chat_pass      chat_password
 
+\set graph_user     graph_user
+\set graph_pass     graph_password
+
+-- Сид-администратор. Создаётся при первой инициализации базы, чтобы вход в админ-панель
+-- был возможен сразу после `docker compose up`: роль admin ставится только в БД, а до БД
+-- добираются через саму панель — без сида это замкнутый круг (см. services/db-svc/README.md).
+-- ВАЖНО: пароль ниже — для локальной разработки. Перед выкладкой наружу смените его
+-- или удалите этого пользователя.
+-- Домен обязан быть @edu.hse.ru: фронтенд проверяет его в isValidEmail() ДО отправки запроса
+-- (main/frontend/src/shared/lib/validators.js) и на отказ показывает тот же текст, что и на
+-- неверный пароль. С любым другим адресом форма входа молча не отправляет запрос вообще.
+-- Служебные TLD (.local, .test, .example, localhost) отпадают и по второй причине: auth-svc
+-- валидирует адрес через pydantic EmailStr, который их отвергает.
+\set seed_admin_email     admin@edu.hse.ru
+\set seed_admin_password  admin
+
+-- Размерность векторов модели эмбеддингов (mxbai-embed-large-v1 → 1024).
+-- Должна совпадать с EMBEDDING_DIM в корневом .env: ingest-worker и graph-rag-svc
+-- сверяют это значение с фактическим типом колонки при запуске и не стартуют при
+-- расхождении. Смена модели эмбеддингов требует пересчёта всех чанков и всего графа.
+\set embedding_dim  1024
+
 
 -- =============================================================
 -- FULL SCHEMA INIT (core + auth + chat + library)
@@ -48,6 +70,7 @@ CREATE SCHEMA IF NOT EXISTS core;
 CREATE SCHEMA IF NOT EXISTS auth;
 CREATE SCHEMA IF NOT EXISTS chat;
 CREATE SCHEMA IF NOT EXISTS library;
+CREATE SCHEMA IF NOT EXISTS graph;
 
 -- =============================================================
 -- CORE
@@ -386,7 +409,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_document_id
 -- pgvector: embeddings table (ENABLED)
 CREATE TABLE IF NOT EXISTS library.chunk_embeddings (
     chunk_id UUID PRIMARY KEY REFERENCES library.chunks(id) ON DELETE CASCADE,
-    embedding VECTOR(1024) NOT NULL,
+    embedding VECTOR(:embedding_dim) NOT NULL,
     embedding_model TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -503,12 +526,179 @@ CREATE INDEX IF NOT EXISTS idx_places_type
     ON library.places(place_type);
 
 -- =============================================================
+-- GRAPH (entity/relation knowledge graph for graph-rag-svc)
+-- - Populated offline by graph-rag-svc's graph-builder CLI from library.chunks
+-- - Read/queried online by graph-rag-svc's retrieval pipeline
+-- =============================================================
+
+CREATE TABLE IF NOT EXISTS graph.extraction_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_type TEXT NOT NULL,                  -- 'full_rebuild' | 'incremental' | 'bootstrap_jsonl'
+    extraction_model TEXT,
+    ontology_version TEXT NOT NULL,
+    document_ids UUID[],                     -- NULL = all documents
+    status TEXT NOT NULL DEFAULT 'running',  -- 'running' | 'completed' | 'failed'
+    stats_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS graph.entities (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_type TEXT NOT NULL,             -- fixed ontology: Студент, Преподаватель, Учебный офис, Приказ, ...
+    canonical_name TEXT NOT NULL,
+    name_embedding VECTOR(:embedding_dim), -- same model/dims as library.chunk_embeddings; NULL until backfilled
+    embedding_model TEXT,
+    attributes_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE(entity_type, canonical_name)
+);
+
+CREATE TABLE IF NOT EXISTS graph.entity_aliases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id UUID NOT NULL REFERENCES graph.entities(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    alias_normalized TEXT NOT NULL,        -- lowercased/trimmed, indexed for fast exact lookup
+    source TEXT NOT NULL DEFAULT 'extraction',  -- 'extraction' | 'manual' | 'llm_merge'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE(entity_id, alias_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized
+    ON graph.entity_aliases(alias_normalized);
+
+CREATE TABLE IF NOT EXISTS graph.relations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject_entity_id UUID NOT NULL REFERENCES graph.entities(id) ON DELETE CASCADE,
+    object_entity_id UUID NOT NULL REFERENCES graph.entities(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,                -- infinitive verb, per ontology convention
+    confidence REAL,
+    extraction_run_id UUID REFERENCES graph.extraction_runs(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE(subject_entity_id, object_entity_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relations_subject
+    ON graph.relations(subject_entity_id);
+
+CREATE INDEX IF NOT EXISTS idx_relations_object
+    ON graph.relations(object_entity_id);
+
+CREATE TABLE IF NOT EXISTS graph.entity_source_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id UUID REFERENCES graph.entities(id) ON DELETE CASCADE,
+    relation_id UUID REFERENCES graph.relations(id) ON DELETE CASCADE,
+    chunk_id UUID NOT NULL REFERENCES library.chunks(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CHECK (entity_id IS NOT NULL OR relation_id IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_source_chunks_chunk
+    ON graph.entity_source_chunks(chunk_id);
+
+-- =========================================================
+-- Схема rag: нейтральная аналитика ретривала, общая для обоих проектов.
+-- У соседнего проекта нет схемы chat, поэтому аналог chat.rag_runs нужен вне её.
+-- Пишут оба экземпляра graph-rag-svc; колонка consumer разделяет трафик команд.
+-- =========================================================
+CREATE SCHEMA IF NOT EXISTS rag;
+
+CREATE TABLE IF NOT EXISTS rag.retrieval_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id TEXT NOT NULL,
+    consumer TEXT,
+    session_id TEXT,
+    user_id TEXT,
+    question TEXT NOT NULL,
+    route_used TEXT,
+    query_embedding_model TEXT,
+    retrieved_chunk_ids UUID[],
+    retrieved_doc_ids UUID[],
+    scores_json JSONB,
+    retrieval_ms DOUBLE PRECISION,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    status TEXT NOT NULL DEFAULT 'completed',
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_runs_created_at
+    ON rag.retrieval_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_retrieval_runs_consumer
+    ON rag.retrieval_runs(consumer);
+
+-- Стоп-лист ручного курирования: построение графа идёт через upsert, поэтому просто
+-- удалённая сущность была бы заново создана следующей пересборкой. Проверяется в
+-- app/graph/resolution.py::resolve_entity.
+CREATE TABLE IF NOT EXISTS graph.curation_blocklist (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name_normalized TEXT NOT NULL UNIQUE,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- pgvector index on entity name embeddings (same safe-creation pattern as library.chunk_embeddings)
+DO $$
+BEGIN
+  IF to_regclass('graph.entities') IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_am WHERE amname = 'hnsw') THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_graph_entities_embedding_hnsw ' ||
+            'ON graph.entities USING hnsw (name_embedding vector_cosine_ops)';
+  ELSE
+    IF COALESCE(
+         (SELECT reltuples::bigint
+          FROM pg_class
+          WHERE oid = to_regclass('graph.entities')),
+         0
+       ) >= 10000 THEN
+      EXECUTE 'CREATE INDEX IF NOT EXISTS idx_graph_entities_embedding_ivfflat ' ||
+              'ON graph.entities USING ivfflat (name_embedding vector_cosine_ops) WITH (lists = 100)';
+    END IF;
+  END IF;
+END $$;
+
+-- =============================================================
 -- Notes for IVFFlat
 -- After inserting/updating a lot of rows in library.chunk_embeddings:
 --   ANALYZE library.chunk_embeddings;
 -- And for better recall (per session):
 --   SET ivfflat.probes = 10;  -- tune 1..100
 -- =============================================================
+
+-- ============================================================
+-- 1.9) СИД: администратор по умолчанию
+--    Хеш пароля считается тем же bcrypt, что использует auth-svc (passlib/bcrypt
+--    читает формат $2a$, который выдаёт pgcrypto), поэтому обычный логин через
+--    POST /auth/login с этим паролем работает без дополнительных шагов.
+--    Профиль создаётся сразу: GET /users/me отвечает 404, если строки профиля нет,
+--    а фронтенд без него не покажет кнопку входа в админку.
+-- ============================================================
+
+INSERT INTO auth.users (email, password_hash, role, is_email_verified, is_active)
+VALUES (
+    :'seed_admin_email',
+    crypt(:'seed_admin_password', gen_salt('bf', 12)),
+    'admin',
+    true,
+    true
+)
+ON CONFLICT (email) DO NOTHING;
+
+INSERT INTO auth.user_profiles (user_id, first_name, last_name)
+SELECT id, 'Admin', 'Pochemuchnik'
+FROM auth.users
+WHERE email = :'seed_admin_email'
+ON CONFLICT (user_id) DO NOTHING;
 
 -- ============================================================
 -- 2) РОЛИ + ПРАВА (после создания схем/таблиц)
@@ -531,6 +721,10 @@ SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'chat_user', :'chat_pass')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'chat_user')
 \gexec
 
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'graph_user', :'graph_pass')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'graph_user')
+\gexec
+
 -- 2.2) Запретить PUBLIC лишнее на БД
 SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db_name')
 \gexec
@@ -545,15 +739,17 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'library_user')
 \gexec
 SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'chat_user')
 \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'graph_user')
+\gexec
 -- (опционально) админу:
 SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', :'db_name', :'admin_user')
 \gexec
 
 -- 2.4) Доступ к схемам
-SELECT format('GRANT USAGE ON SCHEMA core, auth, library, chat TO %I', :'admin_user')
+SELECT format('GRANT USAGE ON SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
 \gexec
 
-SELECT format('GRANT USAGE ON SCHEMA core TO %I, %I, %I', :'auth_user', :'library_user', :'chat_user')
+SELECT format('GRANT USAGE ON SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
 \gexec
 
 SELECT format('GRANT USAGE ON SCHEMA auth TO %I', :'auth_user')
@@ -562,16 +758,37 @@ SELECT format('GRANT USAGE ON SCHEMA library TO %I', :'library_user')
 \gexec
 SELECT format('GRANT USAGE ON SCHEMA chat TO %I', :'chat_user')
 \gexec
+SELECT format('GRANT USAGE ON SCHEMA graph TO %I', :'graph_user')
+\gexec
+SELECT format('GRANT USAGE ON SCHEMA rag TO %I', :'graph_user')
+\gexec
+-- graph-rag-svc reads chunks/documents from library (read-only), never writes there
+SELECT format('GRANT USAGE ON SCHEMA library TO %I', :'graph_user')
+\gexec
 
 -- 2.5) Права на существующие таблицы/последовательности
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core, auth, library, chat TO %I', :'admin_user')
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
 \gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA core, auth, library, chat TO %I', :'admin_user')
+SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
 \gexec
 
-SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA core TO %I, %I, %I', :'auth_user', :'library_user', :'chat_user')
+SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
 \gexec
-SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA core TO %I, %I, %I', :'auth_user', :'library_user', :'chat_user')
+SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
+\gexec
+
+-- graph-rag-svc: read-only on library (chunks/documents), full CRUD on its own `graph` schema
+SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA library TO %I', :'graph_user')
+\gexec
+SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA library TO %I', :'graph_user')
+\gexec
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graph TO %I', :'graph_user')
+\gexec
+SELECT format('GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA rag TO %I', :'graph_user')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA rag GRANT SELECT, INSERT ON TABLES TO %I', :'graph_user')
+\gexec
+SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA graph TO %I', :'graph_user')
 \gexec
 
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA auth TO %I', :'auth_user')
@@ -611,10 +828,21 @@ SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT SELECT, INSERT, UPD
 SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
 \gexec
 
--- core: чтение на будущее всем сервисам
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT SELECT ON TABLES TO %I, %I, %I', :'auth_user', :'library_user', :'chat_user')
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
 \gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT USAGE, SELECT ON SEQUENCES TO %I, %I, %I', :'auth_user', :'library_user', :'chat_user')
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
+\gexec
+
+-- core: чтение на будущее всем сервисам
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT SELECT ON TABLES TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT USAGE, SELECT ON SEQUENCES TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
+\gexec
+
+-- library: чтение на будущее graph-rag-svc (read-only)
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT SELECT ON TABLES TO %I', :'graph_user')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT USAGE, SELECT ON SEQUENCES TO %I', :'graph_user')
 \gexec
 
 -- приватные схемы: полные права своему сервису на будущее
@@ -633,8 +861,13 @@ SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT SELECT, INSERT, UPD
 SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'chat_user')
 \gexec
 
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'graph_user')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'graph_user')
+\gexec
+
 -- 2.7) search_path
-SELECT format('ALTER ROLE %I SET search_path = core, auth, library, chat, public', :'admin_user')
+SELECT format('ALTER ROLE %I SET search_path = core, auth, library, chat, graph, public', :'admin_user')
 \gexec
 
 SELECT format('ALTER ROLE %I SET search_path = auth, core, public', :'auth_user')
@@ -643,8 +876,11 @@ SELECT format('ALTER ROLE %I SET search_path = library, core, public', :'library
 \gexec
 SELECT format('ALTER ROLE %I SET search_path = chat, core, public', :'chat_user')
 \gexec
+SELECT format('ALTER ROLE %I SET search_path = graph, library, core, public', :'graph_user')
+\gexec
 -- 2.3) Закрываем схемы для PUBLIC
 REVOKE ALL ON SCHEMA core FROM PUBLIC;
 REVOKE ALL ON SCHEMA auth FROM PUBLIC;
 REVOKE ALL ON SCHEMA library FROM PUBLIC;
 REVOKE ALL ON SCHEMA chat FROM PUBLIC;
+REVOKE ALL ON SCHEMA graph FROM PUBLIC;
