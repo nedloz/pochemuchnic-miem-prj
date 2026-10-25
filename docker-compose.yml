@@ -168,7 +168,7 @@ services:
 
   embedding-svc:
     build:
-      context: ../services/embedding-svc
+      context: ./services/embedding-svc
       dockerfile: Dockerfile
     container_name: embedding-svc
     restart: unless-stopped
@@ -176,7 +176,7 @@ services:
     # ports:
     #   - "127.0.0.1:${EMBEDDING_PUBLIC_PORT}:8000"
     env_file:
-      - ../services/embedding-svc/.env
+      - ./services/embedding-svc/.env
     environment:
       EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
     volumes:
@@ -193,34 +193,34 @@ services:
 
   auth-svc:
     build:
-      context: ../services/auth-svc
+      context: ./services/auth-svc
       dockerfile: Dockerfile
     container_name: auth-svc
     restart: unless-stopped
     # ports:
     #   - "${AUTH_PUBLIC_PORT}:8000"
     env_file:
-      - ../services/auth-svc/.env
+      - ./services/auth-svc/.env
     environment:
       # PORT здесь не задаём: порт зашит в CMD Dockerfile'а (8000), а переменная
       # AUTH_INTERNAL_PORT нигде не определена — compose ругался на пустое значение.
       DATABASE_URL: ${AUTH_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
     volumes:
-      - ../services/auth-svc:/app
+      - ./services/auth-svc:/app
     networks:
       - app-network
 
   library-svc:
     build:
-      context: ../services/library-svc
+      context: ./services/library-svc
       dockerfile: Dockerfile
     container_name: library-svc
     restart: unless-stopped
     # Порт намеренно не публикуется: у сервиса нет собственной аутентификации, и снаружи
     # он должен быть доступен только через nginx, который проверяет JWT (auth_request).
     env_file:
-      - ../services/library-svc/.env
+      - ./services/library-svc/.env
     environment:
       POSTGRES_USER: ${LIBRARY_DB_USER}
       POSTGRES_PASSWORD: ${LIBRARY_DB_PASSWORD}
@@ -233,14 +233,14 @@ services:
       MINIO_REGION: ${MINIO_REGION}
       MINIO_SECURE: ${MINIO_SECURE}
     volumes:
-      - ../services/library-svc:/app
+      - ./services/library-svc:/app
     networks:
       - library-gateway
       - library-backend
 
   chat-svc:
     build:
-      context: ../services/chat-svc
+      context: ./services/chat-svc
       dockerfile: Dockerfile
     container_name: chat-svc
     restart: unless-stopped
@@ -248,7 +248,7 @@ services:
     # X-User-Id, который проставляет nginx после auth_request. Прямой доступ к контейнеру
     # позволил бы подделать этот заголовок и войти в любую чужую сессию.
     env_file:
-      - ../services/chat-svc/.env
+      - ./services/chat-svc/.env
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 8000
@@ -260,7 +260,7 @@ services:
 
   graph-rag-svc:
     build:
-      context: ../services/graph-rag-svc
+      context: ./services/graph-rag-svc
       dockerfile: Dockerfile
       args:
         # Ставить torch/transformers/accelerate в образ (~5 ГБ) или нет. Нужны только
@@ -272,7 +272,7 @@ services:
     # ports:
     #   - "127.0.0.1:${GRAPH_RAG_PUBLIC_PORT}:8000"
     env_file:
-      - ../services/graph-rag-svc/.env
+      - ./services/graph-rag-svc/.env
     environment:
       DATABASE_URL: ${GRAPH_RAG_DATABASE_URL}
       EMBEDDING_SVC_URL: http://embedding-svc:8000
@@ -293,13 +293,13 @@ services:
 
   ingest-worker:
     build:
-      context: ../services/ingest-worker
+      context: ./services/ingest-worker
       dockerfile: Dockerfile
     container_name: ingest-worker
     restart: unless-stopped
     # Порт не публикуется: это background worker без HTTP-сервера.
     env_file:
-      - ../services/ingest-worker/.env
+      - ./services/ingest-worker/.env
     environment:
       DATABASE_URL: ${INGESTWOKRER_DATABASE_URL}
       EMBEDDING_SVC_URL: http://embedding-svc:8000
@@ -312,7 +312,7 @@ services:
       S3_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       S3_SECRET_KEY: ${MINIO_SECRET_KEY}
     volumes:
-      - ../services/ingest-worker:/app
+      - ./services/ingest-worker:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -325,11 +325,11 @@ services:
 
   db-svc:
     build: 
-      context: ../services/db-svc
+      context: ./services/db-svc
       dockerfile: Dockerfile
     container_name: db-svc
     env_file:
-      - ../services/db-svc/.env
+      - ./services/db-svc/.env
     environment:
       POSTGRES_USER: ${POSTGRES_ADMIN_USER}
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
