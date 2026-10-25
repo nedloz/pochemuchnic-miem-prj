@@ -30,3 +30,7 @@
 	path = services/library-svc
 	url = git@github.com:nedloz/library-svc.git
 	branch = main
+[submodule "frontend"]
+	path = frontend
+	url = git@github.com:SnapSw1sh/AI-student-mentor.git
+	branch = main
