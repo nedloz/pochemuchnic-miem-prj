@@ -1,0 +1,32 @@
+[submodule "services/auth-svc"]
+	path = services/auth-svc
+	url = git@github.com:nedloz/auth-miem.git
+	branch = main
+[submodule "services/chat-svc"]
+	path = services/chat-svc
+	url = git@github.com:nedloz/chat-svc.git
+	branch = main
+[submodule "services/crawler-svc"]
+	path = services/crawler-svc
+	url = https://github.com/VioleINIt/Crawler.git
+	branch = main
+[submodule "services/db-svc"]
+	path = services/db-svc
+	url = git@github.com:nedloz/db-svc.git
+	branch = main
+[submodule "services/embedding-svc"]
+	path = services/embedding-svc
+	url = git@github.com:nedloz/embedding-svc.git
+	branch = main
+[submodule "services/graph-rag-svc"]
+	path = services/graph-rag-svc
+	url = git@github.com:nedloz/graph-rag-svc.git
+	branch = main
+[submodule "services/ingest-worker"]
+	path = services/ingest-worker
+	url = git@github.com:Hrukalova/ingest_worker.git
+	branch = main
+[submodule "services/library-svc"]
+	path = services/library-svc
+	url = git@github.com:nedloz/library-svc.git
+	branch = main
