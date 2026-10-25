@@ -181,6 +181,17 @@ services:
       EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
     volumes:
       - hf_cache:/app/.cache/huggingface
+    # Готовность, а не факт запуска: /ping отвечает 503, пока модель грузится в фоне, и 200
+    # после. На неё опираются graph-rag-svc и ingest-worker (service_healthy) — раньше они
+    # стартовали по service_started, до загрузки модели. curl в slim-образе нет, поэтому python.
+    # Большой start_period — на первое скачивание весов в пустой hf_cache (bge-m3 ~2.3 ГБ);
+    # с прогретым кешем сервис становится healthy за секунды.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ping', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 900s
     deploy:
       resources:
         reservations:
@@ -287,7 +298,7 @@ services:
       postgres:
         condition: service_healthy
       embedding-svc:
-        condition: service_started
+        condition: service_healthy
     networks:
       - app-network
 
@@ -313,11 +324,21 @@ services:
       S3_SECRET_KEY: ${MINIO_SECRET_KEY}
     volumes:
       - ./services/ingest-worker:/app
+    # HTTP-сервера у воркера нет, поэтому живость сообщается файлом: воркер обновляет
+    # /tmp/ingest-worker.heartbeat каждые 10 с (HEARTBEAT_INTERVAL_SEC), начиная с момента,
+    # когда пройдены стартовые проверки (embedding-svc и размерность колонки в БД). Файл
+    # старше 60 с значит, что воркер не стартовал или завис.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/ingest-worker.heartbeat') > 60)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
     depends_on:
       postgres:
         condition: service_healthy
       embedding-svc:
-        condition: service_started
+        condition: service_healthy
       minio:
         condition: service_healthy
     networks:
