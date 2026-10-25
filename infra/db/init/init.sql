@@ -72,6 +72,21 @@ CREATE SCHEMA IF NOT EXISTS chat;
 CREATE SCHEMA IF NOT EXISTS library;
 CREATE SCHEMA IF NOT EXISTS graph;
 
+-- Размерность pgvector-колонки из схемы БД. Одна реализация для ingest-worker и graph-rag-svc
+-- (раньше у каждого была своя копия запроса, и копии разошлись). Та же функция для уже
+-- поднятых баз — migrations/007_vector_column_dimension.sql; держать в синхроне.
+CREATE OR REPLACE FUNCTION core.vector_column_dimension(schema_table text, col text)
+RETURNS integer
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT substring(format_type(atttypid, atttypmod) FROM '\((\d+)\)')::integer
+    FROM pg_attribute
+    WHERE attrelid = to_regclass(schema_table)
+      AND attname = col
+      AND NOT attisdropped
+$$;
+
 -- =============================================================
 -- CORE
 -- =============================================================
