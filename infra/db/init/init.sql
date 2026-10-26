@@ -829,6 +829,38 @@ CREATE TRIGGER trg_db_actions_no_truncate
     FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_change();
 
 -- ============================================================
+-- Тексты писем (HTML), которые редактируются в админке (db-svc, вкладка «Письма»)
+-- и читаются auth-svc при отправке. Нет строки — auth-svc отправляет встроенный текст.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS core.email_templates (
+    event_type TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    subject_template TEXT NOT NULL,
+    body_html TEXT NOT NULL,
+    placeholders JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO core.email_templates (event_type, title, subject_template, body_html, placeholders)
+VALUES
+    (
+        'email_verification',
+        'Подтверждение электронной почты',
+        'Подтверждение электронной почты',
+        '<h2>Подтверждение электронной почты</h2><p>Для подтверждения адреса электронной почты нажмите на кнопку ниже.</p><p><a href="{verification_url}" style="display:inline-block;padding:12px 20px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:6px;">Подтвердить почту</a></p><p>Если вы не регистрировались в системе, просто проигнорируйте это письмо.</p>',
+        '{"verification_url": "Ссылка для подтверждения почты. Действует ограниченное время"}'
+    ),
+    (
+        'password_reset',
+        'Сброс пароля',
+        'Сброс пароля',
+        '<h2>Сброс пароля</h2><p>Для создания нового пароля нажмите на кнопку ниже.</p><p><a href="{reset_url}" style="display:inline-block;padding:12px 20px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:6px;">Сбросить пароль</a></p><p>Если вы не запрашивали сброс пароля, просто проигнорируйте это письмо.</p>',
+        '{"reset_url": "Ссылка для установки нового пароля. Действует ограниченное время"}'
+    )
+ON CONFLICT (event_type) DO NOTHING;
+
+-- ============================================================
 -- 3) ПРАВА
 --    Выдаются суперпользователем после того, как все объекты созданы.
 -- ============================================================
