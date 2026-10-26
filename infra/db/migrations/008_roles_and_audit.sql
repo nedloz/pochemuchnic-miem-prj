@@ -30,6 +30,19 @@
 
 \set ON_ERROR_STOP on
 
+-- Миграция опирается на схему после 006 (колонки очереди индексации) и 007 (функция размерности):
+-- на них ссылаются точечные права ingest_user. На базе, где их не применяли, она иначе
+-- упала бы в самом конце на выдаче прав, уже передав владение объектами.
+SELECT NOT EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'library' AND table_name = 'documents' AND column_name = 'ingest_attempts'
+       ) OR to_regproc('core.vector_column_dimension') IS NULL AS missing_prerequisites \gset
+\if :missing_prerequisites
+DO $$ BEGIN
+    RAISE EXCEPTION 'Сначала примените миграции 006_ingest_queue.sql и 007_vector_column_dimension.sql.';
+END $$;
+\endif
+
 \i /docker-entrypoint-initdb.d/roles/create_roles.sql
 
 -- 2) Владение. Последовательности, привязанные к колонкам, и индексы переходят вместе с

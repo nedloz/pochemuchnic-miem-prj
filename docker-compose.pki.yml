@@ -21,6 +21,9 @@ x-pki-renewer: &pki-renewer
   restart: unless-stopped
   user: "0"
   entrypoint: ["/bin/sh", "/renewer.sh"]
+  # Образ step-ca проверяет, что в нём отвечает CA; обновляющему контейнеру это не подходит.
+  healthcheck:
+    disable: true
   networks:
     - pki-net
 
@@ -68,6 +71,8 @@ services:
     user: "0"
     pid: "service:postgres"
     entrypoint: ["/bin/sh", "/renewer.sh"]
+    healthcheck:
+      disable: true
     environment:
       CA_URL: https://step-ca:9000
       RENEW_EXEC: "kill -HUP 1"

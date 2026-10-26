@@ -148,15 +148,30 @@ connect() { # роль, переменная с паролем
     docker exec -e PGPASSWORD="$(docker exec "$C" printenv "$2")" "$C" \
         psql -h "$HOST" -U "$1" -d "$DB" -At -c 'SELECT current_user' 2>&1
 }
-for pair in "$AUTH:AUTH_DB_PASSWORD" "$CHAT:CHAT_DB_PASSWORD" "$LIB:LIBRARY_DB_PASSWORD" \
-            "$ING:INGEST_DB_PASSWORD" "$GRAPH:GRAPH_DB_PASSWORD" "$DBS:DBSVC_DB_PASSWORD"; do
-    r=${pair%%:*}; v=${pair##*:}
+PW_ROLES=0
+# Роли в режиме cert (*_DB_AUTH=cert, docker-compose.pki.yml) пароля не имеют: для них проверяется
+# именно это, а вход по сертификату проверяет infra/pki/tests/postgres_cert_auth.sh.
+for triple in "$AUTH:AUTH_DB_PASSWORD:AUTH_DB_AUTH" "$CHAT:CHAT_DB_PASSWORD:CHAT_DB_AUTH" \
+              "$LIB:LIBRARY_DB_PASSWORD:LIBRARY_DB_AUTH" "$ING:INGEST_DB_PASSWORD:INGEST_DB_AUTH" \
+              "$GRAPH:GRAPH_DB_PASSWORD:GRAPH_DB_AUTH" "$DBS:DBSVC_DB_PASSWORD:DBSVC_DB_AUTH"; do
+    IFS=: read -r r v m <<<"$triple"
+    if [[ "$(docker exec "$C" printenv "$m" 2>/dev/null)" == cert ]]; then
+        if [[ $(docker exec "$C" psql -U "$ADMIN" -d "$DB" -At -c "SELECT rolpassword IS NULL FROM pg_authid WHERE rolname='$r'") == t ]]; then
+            pass=$((pass + 1))
+        else
+            fail=$((fail + 1)); echo "ПРОВАЛ  у роли $r в режиме cert есть пароль"
+        fi
+        continue
+    fi
+    PW_ROLES=$((PW_ROLES + 1))
     if [[ $(connect "$r" "$v") == "$r" ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $r не подключается с паролем из $v"; fi
 done
-out=$(docker exec -e PGPASSWORD=wrong "$C" psql -h "$HOST" -U "$AUTH" -d "$DB" -c 'SELECT 1' 2>&1)
-if [[ $out == *"authentication failed"* ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  неверный пароль принят: $out"; fi
+if (( PW_ROLES > 0 )); then
+    out=$(docker exec -e PGPASSWORD=wrong "$C" psql -h "$HOST" -U "$AUTH" -d "$DB" -c 'SELECT 1' 2>&1)
+    if [[ $out == *"authentication failed"* ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  неверный пароль принят: $out"; fi
+fi
 out=$(docker exec -e PGPASSWORD=x "$C" psql -h "$HOST" -U app_owner -d "$DB" -c 'SELECT 1' 2>&1)
-if [[ $out == *"not permitted to log in"* || $out == *"authentication failed"* ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  app_owner может войти: $out"; fi
+if [[ $out == *"not permitted to log in"* || $out == *"authentication failed"* || $out == *"rejects connection"* ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  app_owner может войти: $out"; fi
 
 printf '\nИтого: %d проверок пройдено, %d провалено\n' "$pass" "$fail"
 exit "$fail"
