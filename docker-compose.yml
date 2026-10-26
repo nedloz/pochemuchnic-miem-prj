@@ -203,8 +203,13 @@ services:
     restart: unless-stopped
     ports:
       - "${NGINX_PORT}:80"
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      UPSTREAM_SCHEME: http
+      UPSTREAM_PORT: "8000"
     volumes:
-      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Шаблон конфига: схему и порт апстримов подставляет envsubst образа (infra/nginx/Dockerfile).
+      - ./infra/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
     networks:
       - app-network
       - library-gateway

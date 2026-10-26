@@ -14,5 +14,12 @@ COPY frontend/ ./
 RUN pnpm run build
 
 FROM nginx:1.27-alpine
-COPY infra/nginx/nginx.conf /etc/nginx/nginx.conf
+# Конфиг — шаблон: образ nginx при старте подставляет в него переменные окружения (envsubst) и
+# пишет результат в /etc/nginx/nginx.conf. Схема и порт апстримов (http/8000 или https/8443 в
+# режиме mTLS) приходят из окружения; каталог backend_tls пуст, пока режим mTLS не включён.
+COPY infra/nginx/nginx.conf /etc/nginx/templates/nginx.conf.template
+RUN mkdir -p /etc/nginx/backend_tls
+ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx \
+    UPSTREAM_SCHEME=http \
+    UPSTREAM_PORT=8000
 COPY --from=frontend-build /app/frontend/dist /usr/share/nginx/html

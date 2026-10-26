@@ -4,3 +4,5 @@
 
 # Ключи подписи контекста пользователя (scripts/gen_user_context_keys.py)
 /secrets/
+
+__pycache__/

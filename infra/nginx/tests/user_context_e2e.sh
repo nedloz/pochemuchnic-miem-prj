@@ -66,7 +66,8 @@ stub() { # имя, режим
 }
 stub auth-svc auth; stub chat-svc echo; stub library-svc echo; stub db-svc echo
 docker run -d --name "$P-nginx" --network "$NET" --network-alias nginx \
-    -v "$REPO/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.27-alpine >/dev/null
+    -e NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx -e UPSTREAM_SCHEME=http -e UPSTREAM_PORT=8000 \
+    -v "$REPO/infra/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro" nginx:1.27-alpine >/dev/null
 sleep 3
 if ! docker exec "$P-nginx" nginx -t >/dev/null 2>&1; then
     echo "ПРОВАЛ  nginx -t:"; docker exec "$P-nginx" nginx -t 2>&1 | tail -5; fail=$((fail + 1))

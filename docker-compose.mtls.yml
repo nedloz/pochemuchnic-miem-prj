@@ -1,23 +1,31 @@
-# Дополнение к docker-compose.yml: взаимная TLS-аутентификация (mTLS) между сервисами.
-# Закрывает graph-rag-svc и embedding-svc: к ним можно обратиться только с клиентским
-# сертификатом внутреннего CA, а что именно вызывающему можно, решает его CN
-# (infra/mtls/*.conf). Статические токены X-Service-Token остаются вторым слоем.
+# Дополнение к docker-compose.yml: взаимная TLS-аутентификация (mTLS) между шлюзом и сервисами и
+# между самими сервисами. К каждому сервису можно обратиться только с клиентским сертификатом
+# внутреннего CA, а что именно вызывающему можно, решает его CN (infra/mtls/*.conf). Статические
+# токены X-Service-Token остаются вторым слоем.
 #
-#   chat-svc ──► graph-rag-svc   /generate, /cancel
-#   db-svc   ──► graph-rag-svc   /internal/graph/*
-#   graph-rag-svc, ingest-worker ──► embedding-svc   /embed, /ping
+#   nginx    ──► auth-svc      /auth/*, /users/me           (но не /internal/*)
+#   nginx    ──► chat-svc      /ws/chat (WebSocket)
+#   nginx    ──► library-svc   /library/*, /api/documents/*
+#   nginx    ──► db-svc        админ-панель
+#   chat-svc ──► auth-svc      /internal/users/{id}/profile
+#   chat-svc ──► graph-rag-svc /generate, /cancel
+#   db-svc   ──► graph-rag-svc /internal/graph/*
+#   graph-rag-svc ──► chat-svc /ws/internal/llm (WebSocket)
+#   graph-rag-svc, ingest-worker ──► embedding-svc  /embed, /ping
 #
 # Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
 #
-# Предварительно выпустить сертификаты сервисов (имя = идентичность = CN):
-#   for s in chat-svc db-svc graph-rag-svc embedding-svc ingest-worker; do scripts/pki/enroll.sh "$s"; done
+# Предварительно выпустить сертификаты (имя = идентичность = CN):
+#   for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker; do
+#       scripts/pki/enroll.sh "$s"; done
 # Подробности: infra/pki/README.md, раздел «mTLS между сервисами».
 #
 # Как это устроено. Рядом с получателем работает прокси (nginx) в ТОМ ЖЕ сетевом пространстве
 # (network_mode: service:...). Само приложение переводится на 127.0.0.1, поэтому до него нельзя
 # достучаться напрямую из другого контейнера: открыт только порт 8443 прокси с проверкой
-# сертификата. Вызывающие ходят на https://<сервис>:8443 и предъявляют свой сертификат.
+# сертификата. Вызывающие ходят на https://<сервис>:8443 и предъявляют свой сертификат; шлюз —
+# так же (схема и порт апстримов приходят в nginx переменными UPSTREAM_SCHEME и UPSTREAM_PORT).
 # Без этого файла стек работает как раньше.
 
 x-mtls-renewer: &mtls-renewer
@@ -31,6 +39,10 @@ x-mtls-renewer: &mtls-renewer
   networks:
     - pki-net
 
+x-mtls-sidecar: &mtls-sidecar
+  image: nginx:1.27-alpine
+  restart: unless-stopped
+
 # Как вызывающий сервис находит свой клиентский сертификат (app/mtls.py в каждом сервисе).
 x-mtls-client-env: &mtls-client-env
   SERVICE_MTLS_CERT: /pki-svc/tls.crt
@@ -38,24 +50,94 @@ x-mtls-client-env: &mtls-client-env
   SERVICE_MTLS_CA: /pki-svc/root_ca.crt
 
 services:
+  # --- шлюз: ходит в сервисы со своим сертификатом ---
+
+  nginx:
+    environment:
+      UPSTREAM_SCHEME: https
+      UPSTREAM_PORT: "8443"
+    volumes:
+      - mtls_nginx:/pki-svc:ro
+      - ./infra/nginx/backend_tls.conf:/etc/nginx/backend_tls/tls.conf:ro
+
+  nginx-certs:
+    <<: *mtls-renewer
+    # Общее пространство процессов с nginx: после обновления сертификата он получает SIGHUP
+    # (PID 1 в его контейнере) и перечитывает файлы.
+    pid: "service:nginx"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_nginx:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
   # --- получатели: приложение слушает только localhost, снаружи — прокси ---
+
+  auth-svc:
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+
+  auth-svc-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:auth-svc"
+    depends_on:
+      auth-svc:
+        condition: service_started
+        # пересоздали получателя через compose — пересоздаётся и прокси в его пространстве
+        restart: true
+    volumes:
+      - mtls_auth-svc:/pki-svc:ro
+      - ./infra/mtls/auth-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
+  auth-svc-certs:
+    <<: *mtls-renewer
+    pid: "service:auth-svc-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_auth-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  library-svc:
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+
+  library-svc-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:library-svc"
+    depends_on:
+      library-svc:
+        condition: service_started
+        restart: true
+    volumes:
+      - mtls_library-svc:/pki-svc:ro
+      - ./infra/mtls/library-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
+  library-svc-certs:
+    <<: *mtls-renewer
+    pid: "service:library-svc-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_library-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
 
   graph-rag-svc:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
       <<: *mtls-client-env
       EMBEDDING_SVC_URL: https://embedding-svc:8443
+      CHAT_WS_URL: wss://chat-svc:8443/ws/internal/llm
     volumes:
       - mtls_graph-rag-svc:/pki-svc:ro
 
   graph-rag-svc-mtls:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
+    <<: *mtls-sidecar
     network_mode: "service:graph-rag-svc"
     depends_on:
       graph-rag-svc:
         condition: service_started
-        # пересоздали получателя через compose — пересоздаётся и прокси в его пространстве
         restart: true
     volumes:
       - mtls_graph-rag-svc:/pki-svc:ro
@@ -63,8 +145,6 @@ services:
 
   graph-rag-svc-certs:
     <<: *mtls-renewer
-    # Общее пространство процессов с прокси: после обновления сертификата он получает SIGHUP
-    # (PID 1 в его контейнере) и перечитывает файлы.
     pid: "service:graph-rag-svc-mtls"
     environment:
       CA_URL: https://step-ca:9000
@@ -79,13 +159,11 @@ services:
       - mtls_embedding-svc:/pki-svc:ro
 
   embedding-svc-mtls:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
+    <<: *mtls-sidecar
     network_mode: "service:embedding-svc"
     depends_on:
       embedding-svc:
         condition: service_started
-        # пересоздали получателя через compose — пересоздаётся и прокси в его пространстве
         restart: true
     volumes:
       - mtls_embedding-svc:/pki-svc:ro
@@ -101,38 +179,69 @@ services:
       - mtls_embedding-svc:/certs
       - ./infra/pki/renewer.sh:/renewer.sh:ro
 
-  # --- вызывающие: свой сертификат и адреса по https ---
+  # --- chat-svc и db-svc: и получатели (за шлюзом), и вызывающие (graph-rag-svc, auth-svc) ---
 
   chat-svc:
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
       <<: *mtls-client-env
       LLM_STREAM_URL: https://graph-rag-svc:8443/generate
       LLM_CANCEL_URL: https://graph-rag-svc:8443/cancel
+      AUTH_PROFILE_URL: https://auth-svc:8443/internal/users/{user_id}/profile
     volumes:
       - mtls_chat-svc:/pki-svc:ro
 
+  chat-svc-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:chat-svc"
+    depends_on:
+      chat-svc:
+        condition: service_started
+        restart: true
+    volumes:
+      - mtls_chat-svc:/pki-svc:ro
+      - ./infra/mtls/chat-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
   chat-svc-certs:
     <<: *mtls-renewer
+    pid: "service:chat-svc-mtls"
     environment:
       CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
     volumes:
       - mtls_chat-svc:/certs
       - ./infra/pki/renewer.sh:/renewer.sh:ro
 
   db-svc:
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
       <<: *mtls-client-env
       GRAPH_RAG_URL: https://graph-rag-svc:8443
     volumes:
       - mtls_db-svc:/pki-svc:ro
 
+  db-svc-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:db-svc"
+    depends_on:
+      db-svc:
+        condition: service_started
+        restart: true
+    volumes:
+      - mtls_db-svc:/pki-svc:ro
+      - ./infra/mtls/db-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
   db-svc-certs:
     <<: *mtls-renewer
+    pid: "service:db-svc-mtls"
     environment:
       CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
     volumes:
       - mtls_db-svc:/certs
       - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  # --- вызывающий без собственного сервера ---
 
   ingest-worker:
     environment:
@@ -151,6 +260,15 @@ services:
 
 # Тома создаёт scripts/pki/enroll.sh; имя тома = pki_certs_<идентичность>.
 volumes:
+  mtls_nginx:
+    external: true
+    name: pki_certs_nginx
+  mtls_auth-svc:
+    external: true
+    name: pki_certs_auth-svc
+  mtls_library-svc:
+    external: true
+    name: pki_certs_library-svc
   mtls_graph-rag-svc:
     external: true
     name: pki_certs_graph-rag-svc

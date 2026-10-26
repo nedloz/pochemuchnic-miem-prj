@@ -18,6 +18,8 @@ sys.path.insert(0, "/srv")
 import user_context  # noqa: E402
 
 KIND = os.environ["STUB"]
+# В режиме mTLS приложение слушает только localhost, как после переключения (docker-compose.mtls.yml).
+BIND = os.environ.get("BIND", "0.0.0.0")
 USERS = {
     "user-token": ("11111111-1111-1111-1111-111111111111", "student"),
     "admin-token": ("22222222-2222-2222-2222-222222222222", "admin"),
@@ -41,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._handle()
 
-    do_POST = do_GET
+    do_POST = do_PATCH = do_DELETE = do_PUT = do_GET
 
     def _handle(self):
         parsed = urlparse(self.path)
@@ -70,7 +72,8 @@ class Handler(BaseHTTPRequestHandler):
             uid, role = USERS["admin-token"]
             return self._reply(200, {"status": "valid"}, {user_context.HEADER: user_context.sign(master, aud, uid, role)})
         # публичные маршруты auth-svc (логин и т. п.): показываем, что до них дошло
-        return self._reply(200, {"path": parsed.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        return self._reply(200, {"path": parsed.path, "headers": headers, "caller": headers.get("x-caller-identity")})
 
     # --- получатель ---
     def _echo(self):
@@ -80,7 +83,8 @@ class Handler(BaseHTTPRequestHandler):
             verified = {"user_id": ctx.user_id, "role": ctx.role, "aud": ctx.audience}
         except user_context.UserContextError as exc:
             verified = {"error": str(exc)}
-        self._reply(200, {"service": os.environ["USER_CONTEXT_AUDIENCE"], "headers": headers, "verified": verified})
+        self._reply(200, {"service": os.environ["USER_CONTEXT_AUDIENCE"], "headers": headers, "verified": verified,
+                          "caller": headers.get("x-caller-identity"), "path": self.path})
 
 
-ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+ThreadingHTTPServer((BIND, 8000), Handler).serve_forever()

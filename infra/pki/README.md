@@ -125,40 +125,58 @@ infra/pki/tests/selftest.sh
 
 Отдельная проверка Postgres и db-svc по сертификатам: `infra/pki/tests/postgres_cert_auth.sh`.
 
-## mTLS между сервисами
+## mTLS между шлюзом и сервисами и между сервисами
 
-`docker-compose.mtls.yml` закрывает сертификатами два сервиса, к которым ходят только другие
-сервисы: graph-rag-svc и embedding-svc.
+`docker-compose.mtls.yml` закрывает сертификатами все HTTP-связи в стеке: до любого сервиса можно
+достучаться только с клиентским сертификатом нашего CA, а что именно вызывающему можно, решает
+его CN.
 
 ```
-chat-svc ──► graph-rag-svc   /generate, /cancel
-db-svc   ──► graph-rag-svc   /internal/graph/*
+nginx    ──► auth-svc      /auth/*, /users/me           (но не /internal/*)
+nginx    ──► chat-svc      /ws/chat (WebSocket)
+nginx    ──► library-svc   /library/*, /api/documents/*
+nginx    ──► db-svc        админ-панель
+chat-svc ──► auth-svc      /internal/users/{id}/profile
+chat-svc ──► graph-rag-svc /generate, /cancel
+db-svc   ──► graph-rag-svc /internal/graph/*
+graph-rag-svc ──► chat-svc /ws/internal/llm (WebSocket)
 graph-rag-svc, ingest-worker ──► embedding-svc   /embed, /ping
 ```
 
 **Как устроено.** Рядом с получателем работает прокси (nginx) **в том же сетевом пространстве**
 (`network_mode: service:...`). Приложение переводится на `127.0.0.1`, поэтому из другого
 контейнера до него не достучаться: открыт только порт 8443 прокси, который требует клиентский
-сертификат нашего CA. Что вызывающему можно, решает его CN: правила лежат в
-`infra/mtls/graph-rag-svc.conf` и `infra/mtls/embedding-svc.conf` (путь нормализуется, поэтому
-обход через `/generate/../internal/graph/` не работает). Приложению прокси сообщает проверенное
-имя вызывающего в `X-Caller-Identity`, присланное клиентом значение отбрасывается. Статические
-токены `X-Service-Token` остаются вторым слоем.
+сертификат нашего CA. Правила «кто что может» лежат в `infra/mtls/<сервис>.conf` (путь
+нормализуется, поэтому обход через `/generate/../internal/graph/` не работает). Приложению прокси
+сообщает проверенное имя вызывающего в `X-Caller-Identity`, присланное клиентом значение
+отбрасывается. Статические токены `X-Service-Token` остаются вторым слоем.
+
+**Шлюз.** nginx тоже имеет сертификат (идентичность `nginx`). Его конфиг один на оба режима:
+`nginx.conf` — шаблон, схему и порт апстримов (`http`/`8000` или `https`/`8443`) подставляет
+`envsubst` образа из переменных `UPSTREAM_SCHEME` и `UPSTREAM_PORT`, а `proxy_ssl_*` подключаются
+файлом `infra/nginx/backend_tls.conf` только в режиме mTLS. Шлюзу разрешены публичные пути
+сервисов и запрещён `/internal/*`: даже скомпрометированный шлюз до внутренних маршрутов не
+доберётся. После обновления сертификата шлюз получает `SIGHUP` (контейнер `nginx-certs`).
 
 **Вызывающие** используют `app/mtls.py` (одинаков в chat-svc, db-svc, graph-rag-svc,
-ingest-worker): контекст TLS с их сертификатом собирается при создании каждого HTTP-клиента, а
-клиенты создаются на каждый вызов, так что суточный сертификат подхватывается без
-перезапуска. Без `SERVICE_MTLS_CERT` всё работает как раньше, по открытому HTTP.
+ingest-worker): контекст TLS с их сертификатом собирается при создании каждого HTTP-клиента или
+WebSocket-подключения, так что суточный сертификат подхватывается без перезапуска. Без
+`SERVICE_MTLS_CERT` всё работает как раньше, по открытому HTTP.
 
 **Включение**
 
 ```bash
-for s in chat-svc db-svc graph-rag-svc embedding-svc ingest-worker; do scripts/pki/enroll.sh "$s"; done
+for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker; do
+    scripts/pki/enroll.sh "$s"; done
 # в .env: COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
-docker compose --profile pki up -d --no-deps graph-rag-svc graph-rag-svc-mtls graph-rag-svc-certs \
-    embedding-svc embedding-svc-mtls embedding-svc-certs chat-svc chat-svc-certs \
-    db-svc db-svc-certs ingest-worker ingest-worker-certs
+docker compose --profile pki up -d --no-deps auth-svc auth-svc-mtls auth-svc-certs \
+    library-svc library-svc-mtls library-svc-certs chat-svc chat-svc-mtls chat-svc-certs \
+    db-svc db-svc-mtls db-svc-certs nginx nginx-certs
+# graph-rag-svc, embedding-svc и ingest-worker (и их *-mtls, *-certs) — когда будет запущен embedding-svc
 ```
+
+Сначала получатели и их прокси, потом шлюз: nginx разрешает имена апстримов при старте и без
+запущенных сервисов не поднимется.
 
 **Ограничение Docker.** Прокси живёт в сетевом пространстве получателя. Если получатель
 перезапускается (`docker restart`, падение и подъём по `restart: unless-stopped`) или
@@ -169,25 +187,19 @@ docker compose --profile pki up -d --no-deps graph-rag-svc graph-rag-svc-mtls gr
 цикле перезапусков (как graph-rag-svc, пока недоступен embedding-svc) нужно чинить раньше, чем
 включать mTLS. В Kubernetes и Linkerd этой проблемы нет: прокси и приложение — один под.
 
-**Состояние на этом стенде.** `COMPOSE_FILE` в `.env` включает `docker-compose.mtls.yml`, chat-svc
-и db-svc уже работают с клиентскими сертификатами и ходят на `https://graph-rag-svc:8443`.
-embedding-svc, ollama, graph-rag-svc и ingest-worker по договорённости не запущены (embedding-svc
-держит GPU, без него graph-rag-svc и ingest-worker не стартуют), поэтому проверка пути
-«вопрос → ответ» через прокси возможна только на одноразовых контейнерах
-(`infra/mtls/tests/mtls_e2e.sh`). Сертификаты graph-rag-svc, embedding-svc и ingest-worker выпущены
-на сутки и обновляются только пока работают их обновляющие контейнеры: перед запуском этих
-сервисов выпустите их заново (`scripts/pki/enroll.sh <имя>`, он перезаписывает том), затем
-`docker compose --profile pki up -d --no-deps` для самих сервисов, их прокси `*-mtls` и
-`*-certs`. Прокси запускается после получателя, а при перезапуске получателя его нужно
-перезапустить тоже.
+**Состояние на этом стенде.** embedding-svc, ollama, graph-rag-svc и ingest-worker по договорённости
+не запущены (embedding-svc держит GPU, без него graph-rag-svc и ingest-worker не стартуют), поэтому
+проверка пути «вопрос → ответ» через прокси возможна только на одноразовых контейнерах. Сертификаты
+этих сервисов выпущены на сутки и обновляются только пока работают их обновляющие контейнеры: перед
+запуском выпустите их заново (`scripts/pki/enroll.sh <имя>`, он перезаписывает том).
 
-**Проверка**: `infra/mtls/tests/mtls_e2e.sh` — политика по таблице «кто что может», отказ без
-сертификата и с самоподписанным «двойником», невозможность обойти прокси, настоящий клиентский код
-сервисов и перечитывание сертификата прокси после обновления.
-
-**Не закрыто этим шагом.** Вызовы chat-svc → auth-svc (`/internal/users/...`) и
-graph-rag-svc → chat-svc (WebSocket `/ws/internal/llm`) идут по-прежнему на токенах: оба
-получателя обслуживают ещё и nginx, поэтому для них нужен клиентский сертификат у шлюза.
+**Проверка**
+- `infra/mtls/tests/mtls_e2e.sh` — graph-rag-svc и embedding-svc: политика, отказ без сертификата и
+  с самоподписанным «двойником», невозможность обойти прокси, настоящий клиентский код сервисов,
+  перечитывание сертификата прокси.
+- `infra/mtls/tests/gateway_e2e.sh` — шлюз и пользовательские сервисы: настоящий `nginx.conf` в режиме
+  https, прокси перед auth-svc, chat-svc, library-svc, db-svc, политика каждой пары, WebSocket через
+  всю цепочку, клиентский код chat-svc и graph-rag-svc, обновление сертификата шлюза.
 
 ## Переезд в Kubernetes
 
@@ -200,10 +212,11 @@ Linkerd к issuer (срок, `pathlen`, ключи) меняются между 
 
 ## Что здесь не сделано
 
-- **Использование сертификатов сервисами.** Postgres и все сервисы, ходящие в него, умеют
-  работать по сертификатам (`infra/db/README.md`, `docker-compose.pki.yml`), а graph-rag-svc и
-  embedding-svc принимают вызовы только по mTLS (см. выше). Остальные HTTP-связи, в первую
-  очередь те, где получатель обслуживает и nginx (auth-svc, chat-svc), пока на токенах.
+- **Использование сертификатов сервисами.** Postgres и все сервисы, ходящие в него, умеют работать по
+  сертификатам (`infra/db/README.md`, `docker-compose.pki.yml`), а все HTTP-связи в стеке (шлюз →
+  сервисы и сервисы между собой) принимаются только по mTLS (`docker-compose.mtls.yml`). Статические
+  токены `X-Service-Token` пока остаются вторым слоем.
+- **MinIO, Redis и Ollama** сертификатами не закрыты: к ним ходят по своим учётным данным.
 - **Высокая доступность CA.** Один экземпляр. Если он упал, существующие сертификаты
   работают до истечения, обновиться нельзя; при суточном сроке запас — несколько часов.
 - **Резервная копия.** Том `step_ca_data` (ключ промежуточного CA, пароль, база выданных
