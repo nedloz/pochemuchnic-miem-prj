@@ -12,12 +12,15 @@
 #   db-svc   ──► graph-rag-svc /internal/graph/*
 #   graph-rag-svc ──► chat-svc /ws/internal/llm (WebSocket)
 #   graph-rag-svc, ingest-worker ──► embedding-svc  /embed, /ping
+#   auth-svc, chat-svc ──► redis  (TCP, порт 6380, плюс ACL-пользователь на сервис)
+#   library-svc, ingest-worker (чтение), db-svc (чтение и запись) ──► minio  (порт 8443, права по CN)
+#   graph-rag-svc ──► ollama  /api/chat и т. п. (профиль llm; модель грузит ollama-init изнутри)
 #
 # Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
 #
 # Предварительно выпустить сертификаты (имя = идентичность = CN):
-#   for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker; do
+#   for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker redis minio ollama; do
 #       scripts/pki/enroll.sh "$s"; done
 # Подробности: infra/pki/README.md, раздел «mTLS между сервисами».
 #
@@ -26,6 +29,8 @@
 # достучаться напрямую из другого контейнера: открыт только порт 8443 прокси с проверкой
 # сертификата. Вызывающие ходят на https://<сервис>:8443 и предъявляют свой сертификат; шлюз —
 # так же (схема и порт апстримов приходят в nginx переменными UPSTREAM_SCHEME и UPSTREAM_PORT).
+# Ещё два шага: python3 scripts/gen_redis_acl.py (пароли и ACL Redis) и
+# python3 scripts/gen_minio_credentials.py (случайные ключи MinIO вместо minioadmin).
 # Без этого файла стек работает как раньше.
 
 x-mtls-renewer: &mtls-renewer
@@ -77,7 +82,11 @@ services:
   auth-svc:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
+      <<: *mtls-client-env
       INTERNAL_AUTH_MODE: mtls
+      REDIS_URL: rediss://auth-svc:${REDIS_AUTH_PASSWORD:?запустите scripts/gen_redis_acl.py}@redis:6380/0
+    volumes:
+      - mtls_auth-svc:/pki-svc:ro
 
   auth-svc-mtls:
     <<: *mtls-sidecar
@@ -101,8 +110,125 @@ services:
       - mtls_auth-svc:/certs
       - ./infra/pki/renewer.sh:/renewer.sh:ro
 
+  # --- Redis: слушает только localhost, снаружи — TCP-прокси с проверкой сертификата ---
+
+  redis:
+    command:
+      - redis-server
+      - --bind
+      - 127.0.0.1
+      - --port
+      - "6379"
+      - --aclfile
+      - /etc/redis/users.acl
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "health", "--pass", "x", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ./secrets/redis/users.acl:/etc/redis/users.acl:ro
+
+  redis-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:redis"
+    depends_on:
+      redis:
+        condition: service_started
+        restart: true
+    volumes:
+      - mtls_redis:/pki-svc:ro
+      - ./infra/mtls/redis.conf:/etc/nginx/nginx.conf:ro
+
+  redis-certs:
+    <<: *mtls-renewer
+    pid: "service:redis-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_redis:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  # --- MinIO: слушает только localhost, снаружи — прокси с правами по CN ---
+
+  minio:
+    command: ["server", "/data", "--address", "127.0.0.1:9000", "--console-address", "127.0.0.1:9001"]
+
+  minio-mtls:
+    <<: *mtls-sidecar
+    network_mode: "service:minio"
+    depends_on:
+      minio:
+        condition: service_started
+        restart: true
+    environment:
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      - mtls_minio:/pki-svc:ro
+      # шаблон: nginx подставляет ${MINIO_BUCKET} при старте контейнера
+      - ./infra/mtls/minio.conf:/etc/nginx/templates/default.conf.template:ro
+
+  minio-certs:
+    <<: *mtls-renewer
+    pid: "service:minio-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_minio:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  # Создаёт бакет изнутри сетевого пространства MinIO, минуя прокси (сертификата у него нет).
+  minio-init:
+    network_mode: "service:minio"
+    networks: !reset null
+    environment:
+      MC_HOST_local: http://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@127.0.0.1:9000
+
+  # --- Ollama (профиль llm): слушает только localhost, снаружи — прокси; модель тянет ollama-init ---
+
+  ollama:
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+
+  ollama-mtls:
+    <<: *mtls-sidecar
+    profiles: ["llm"]
+    network_mode: "service:ollama"
+    depends_on:
+      ollama:
+        condition: service_started
+        restart: true
+    volumes:
+      - mtls_ollama:/pki-svc:ro
+      - ./infra/mtls/ollama.conf:/etc/nginx/conf.d/default.conf:ro
+
+  ollama-certs:
+    <<: *mtls-renewer
+    profiles: ["llm"]
+    pid: "service:ollama-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_ollama:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  ollama-init:
+    network_mode: "service:ollama"
+    networks: !reset null
+    environment:
+      OLLAMA_HOST: http://127.0.0.1:11434
+
   library-svc:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+    environment:
+      <<: *mtls-client-env
+      MINIO_ENDPOINT: minio:8443
+      MINIO_SECURE: "true"
+    volumes:
+      - mtls_library-svc:/pki-svc:ro
 
   library-svc-mtls:
     <<: *mtls-sidecar
@@ -132,6 +258,7 @@ services:
       INTERNAL_AUTH_MODE: mtls
       EMBEDDING_SVC_URL: https://embedding-svc:8443
       CHAT_WS_URL: wss://chat-svc:8443/ws/internal/llm
+      OLLAMA_URL: https://ollama:8443
     volumes:
       - mtls_graph-rag-svc:/pki-svc:ro
 
@@ -194,6 +321,7 @@ services:
       LLM_STREAM_URL: https://graph-rag-svc:8443/generate
       LLM_CANCEL_URL: https://graph-rag-svc:8443/cancel
       AUTH_PROFILE_URL: https://auth-svc:8443/internal/users/{user_id}/profile
+      REDIS_URL: rediss://chat-svc:${REDIS_CHAT_PASSWORD:?запустите scripts/gen_redis_acl.py}@redis:6380/0
     volumes:
       - mtls_chat-svc:/pki-svc:ro
 
@@ -223,6 +351,8 @@ services:
     environment:
       <<: *mtls-client-env
       GRAPH_RAG_URL: https://graph-rag-svc:8443
+      MINIO_ENDPOINT: minio:8443
+      MINIO_SECURE: "true"
     volumes:
       - mtls_db-svc:/pki-svc:ro
 
@@ -253,6 +383,7 @@ services:
     environment:
       <<: *mtls-client-env
       EMBEDDING_SVC_URL: https://embedding-svc:8443
+      S3_ENDPOINT: https://minio:8443
     volumes:
       - mtls_ingest-worker:/pki-svc:ro
 
@@ -266,6 +397,15 @@ services:
 
 # Тома создаёт scripts/pki/enroll.sh; имя тома = pki_certs_<идентичность>.
 volumes:
+  mtls_ollama:
+    external: true
+    name: pki_certs_ollama
+  mtls_minio:
+    external: true
+    name: pki_certs_minio
+  mtls_redis:
+    external: true
+    name: pki_certs_redis
   mtls_nginx:
     external: true
     name: pki_certs_nginx

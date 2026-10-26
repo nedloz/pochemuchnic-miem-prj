@@ -56,6 +56,20 @@ for s in services/*/; do [ -f "$s/.env.example" ] && cp -n "$s/.env.example" "$s
 `insecure`: внутренние вызовы не аутентифицируются, для локальной отладки. На стенде всегда
 поднимайте стек с `docker-compose.mtls.yml`.
 
+### 3.2б. Redis и MinIO за mTLS
+
+Со `docker-compose.mtls.yml` Redis, MinIO (и Ollama) доступны только по сертификату (`infra/pki/README.md`,
+раздел «Хранилища за mTLS»). Перед первым запуском:
+
+```bash
+for s in redis minio ollama; do scripts/pki/enroll.sh "$s"; done
+python3 scripts/gen_redis_acl.py              # пароли и ACL Redis (в .env и secrets/redis/)
+python3 scripts/gen_minio_credentials.py      # случайные ключи MinIO вместо minioadmin
+```
+
+Без этих шагов `docker compose` не соберёт конфигурацию: пароли Redis обязательны. Ключи MinIO при
+смене сохраняют данные бакета.
+
 ### 3.2а. Ключи подписи контекста пользователя
 
 nginx пробрасывает сервисам не голые `X-User-Id` / `X-User-Role`, а подписанный auth-svc токен
