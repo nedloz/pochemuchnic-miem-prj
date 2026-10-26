@@ -6,27 +6,10 @@
 \set ON_ERROR_STOP on
 
 -- ============================================================
--- 0) КОНСТАНТЫ (меняешь только здесь)
---    ВАЖНО: значения без кавычек. Пароли без пробелов.
+-- 0) КОНСТАНТЫ
+--    Имена и пароли ролей сервисов здесь не задаются: они приходят из окружения контейнера
+--    postgres (см. roles/vars.sql), чтобы пароль был один и лежал только в .env.
 -- ============================================================
-
-
-\set db_name        app_db
-
-\set admin_user     app_user
-\set admin_pass     app_password
-
-\set auth_user      auth_user
-\set auth_pass      auth_password
-
-\set library_user   library_user
-\set library_pass   library_password
-
-\set chat_user      chat_user
-\set chat_pass      chat_password
-
-\set graph_user     graph_user
-\set graph_pass     graph_password
 
 -- Сид-администратор. Создаётся при первой инициализации базы, чтобы вход в админ-панель
 -- был возможен сразу после `docker compose up`: роль admin ставится только в БД, а до БД
@@ -62,6 +45,17 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
 CREATE EXTENSION IF NOT EXISTS citext;    -- CITEXT type
 CREATE EXTENSION IF NOT EXISTS vector;    -- pgvector
+
+-- -------------------------
+-- Роли
+-- Создаются до схем: объекты принадлежат NOLOGIN-роли app_owner, а не суперпользователю,
+-- под которым выполняется init. Права выдаются в самом конце (roles/grants.sql).
+-- -------------------------
+\i /docker-entrypoint-initdb.d/roles/create_roles.sql
+
+-- Дальше и до RESET ROLE все объекты создаёт владелец. Без этого они достались бы
+-- суперпользователю, и default privileges владельца на них бы не действовали.
+SET ROLE app_owner;
 
 -- -------------------------
 -- Schemas
@@ -766,186 +760,79 @@ WHERE email = :'seed_admin_email'
 ON CONFLICT (user_id) DO NOTHING;
 
 -- ============================================================
--- 2) РОЛИ + ПРАВА (после создания схем/таблиц)
+-- 2) СЛУЖЕБНЫЕ ОБЪЕКТЫ db-svc
+--    Те же определения — в migrations/008_roles_and_audit.sql для уже поднятых баз;
+--    держать в синхроне.
 -- ============================================================
 
--- 2.1) Роли (CREATE ROLE IF NOT EXISTS) через psql \gexec
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'admin_user', :'admin_pass')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'admin_user')
-\gexec
+-- Журнал задач импорта. Раньше db-svc создавал его сам при старте под ролью-владельцем
+-- базы; теперь у сервиса нет права на DDL, и таблица создаётся здесь.
+CREATE TABLE IF NOT EXISTS public.dbsvc_jobs (
+    id UUID PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    stage TEXT,
+    message TEXT,
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 0,
+    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result JSONB,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ
+);
 
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'auth_user', :'auth_pass')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'auth_user')
-\gexec
+-- Журнал действий администратора в db-svc: кто, когда и что изменил. Только добавление:
+-- у роли db-svc на таблицу есть лишь INSERT и SELECT, а триггер ниже запрещает UPDATE,
+-- DELETE и TRUNCATE даже владельцу, пока он не отключит триггер осознанно.
+-- actor_user_id без внешнего ключа: след должен пережить удаление пользователя.
+CREATE SCHEMA IF NOT EXISTS audit;
 
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'library_user', :'library_pass')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'library_user')
-\gexec
+CREATE TABLE IF NOT EXISTS audit.db_actions (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'token', 'anonymous')),
+    actor_user_id UUID,
+    actor_role TEXT,
+    client_ip TEXT,
+    action TEXT NOT NULL,
+    success BOOLEAN NOT NULL DEFAULT TRUE,
+    target_schema TEXT,
+    target_table TEXT,
+    target_pk TEXT,
+    object_key TEXT,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb
+);
 
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'chat_user', :'chat_pass')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'chat_user')
-\gexec
+CREATE INDEX IF NOT EXISTS idx_db_actions_occurred_at ON audit.db_actions(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_db_actions_actor ON audit.db_actions(actor_user_id);
+CREATE INDEX IF NOT EXISTS idx_db_actions_target ON audit.db_actions(target_schema, target_table);
 
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'graph_user', :'graph_pass')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'graph_user')
-\gexec
+CREATE OR REPLACE FUNCTION audit.forbid_change()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit.db_actions допускает только добавление записей';
+END;
+$$;
 
--- 2.2) Запретить PUBLIC лишнее на БД
-SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db_name')
-\gexec
+DROP TRIGGER IF EXISTS trg_db_actions_immutable ON audit.db_actions;
+CREATE TRIGGER trg_db_actions_immutable
+    BEFORE UPDATE OR DELETE ON audit.db_actions
+    FOR EACH ROW EXECUTE FUNCTION audit.forbid_change();
 
+DROP TRIGGER IF EXISTS trg_db_actions_no_truncate ON audit.db_actions;
+CREATE TRIGGER trg_db_actions_no_truncate
+    BEFORE TRUNCATE ON audit.db_actions
+    FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_change();
 
-SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db_name')
-\gexec
+-- ============================================================
+-- 3) ПРАВА
+--    Выдаются суперпользователем после того, как все объекты созданы.
+-- ============================================================
 
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'auth_user')
-\gexec
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'library_user')
-\gexec
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'chat_user')
-\gexec
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'graph_user')
-\gexec
--- (опционально) админу:
-SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', :'db_name', :'admin_user')
-\gexec
+RESET ROLE;
 
--- 2.4) Доступ к схемам
-SELECT format('GRANT USAGE ON SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
-\gexec
-
-SELECT format('GRANT USAGE ON SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
-\gexec
-
-SELECT format('GRANT USAGE ON SCHEMA auth TO %I', :'auth_user')
-\gexec
-SELECT format('GRANT USAGE ON SCHEMA library TO %I', :'library_user')
-\gexec
-SELECT format('GRANT USAGE ON SCHEMA chat TO %I', :'chat_user')
-\gexec
-SELECT format('GRANT USAGE ON SCHEMA graph TO %I', :'graph_user')
-\gexec
-SELECT format('GRANT USAGE ON SCHEMA rag TO %I', :'graph_user')
-\gexec
--- graph-rag-svc reads chunks/documents from library (read-only), never writes there
-SELECT format('GRANT USAGE ON SCHEMA library TO %I', :'graph_user')
-\gexec
-
--- 2.5) Права на существующие таблицы/последовательности
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA core, auth, library, chat, graph TO %I', :'admin_user')
-\gexec
-
-SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA core TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
-\gexec
-
--- graph-rag-svc: read-only on library (chunks/documents), full CRUD on its own `graph` schema
-SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA library TO %I', :'graph_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA library TO %I', :'graph_user')
-\gexec
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graph TO %I', :'graph_user')
-\gexec
-SELECT format('GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA rag TO %I', :'graph_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA rag GRANT SELECT, INSERT ON TABLES TO %I', :'graph_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA graph TO %I', :'graph_user')
-\gexec
-
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA auth TO %I', :'auth_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA auth TO %I', :'auth_user')
-\gexec
-
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA library TO %I', :'library_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA library TO %I', :'library_user')
-\gexec
-
-SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA chat TO %I', :'chat_user')
-\gexec
-SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA chat TO %I', :'chat_user')
-\gexec
-
--- 2.6) Default privileges (для будущих объектов владельца, который создаёт таблицы)
--- ADMIN: полный доступ на будущее
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'admin_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'admin_user')
-\gexec
-
--- core: чтение на будущее всем сервисам
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT SELECT ON TABLES TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA core GRANT USAGE, SELECT ON SEQUENCES TO %I, %I, %I, %I', :'auth_user', :'library_user', :'chat_user', :'graph_user')
-\gexec
-
--- library: чтение на будущее graph-rag-svc (read-only)
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT SELECT ON TABLES TO %I', :'graph_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT USAGE, SELECT ON SEQUENCES TO %I', :'graph_user')
-\gexec
-
--- приватные схемы: полные права своему сервису на будущее
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'auth_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'auth_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'library_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA library GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'library_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'chat_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA chat GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'chat_user')
-\gexec
-
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'graph_user')
-\gexec
-SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA graph GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'graph_user')
-\gexec
-
--- 2.7) search_path
-SELECT format('ALTER ROLE %I SET search_path = core, auth, library, chat, graph, public', :'admin_user')
-\gexec
-
-SELECT format('ALTER ROLE %I SET search_path = auth, core, public', :'auth_user')
-\gexec
-SELECT format('ALTER ROLE %I SET search_path = library, core, public', :'library_user')
-\gexec
-SELECT format('ALTER ROLE %I SET search_path = chat, core, public', :'chat_user')
-\gexec
-SELECT format('ALTER ROLE %I SET search_path = graph, library, core, public', :'graph_user')
-\gexec
--- 2.3) Закрываем схемы для PUBLIC
-REVOKE ALL ON SCHEMA core FROM PUBLIC;
-REVOKE ALL ON SCHEMA auth FROM PUBLIC;
-REVOKE ALL ON SCHEMA library FROM PUBLIC;
-REVOKE ALL ON SCHEMA chat FROM PUBLIC;
-REVOKE ALL ON SCHEMA graph FROM PUBLIC;
+\i /docker-entrypoint-initdb.d/roles/grants.sql

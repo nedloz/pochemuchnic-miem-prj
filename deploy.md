@@ -64,7 +64,7 @@ python3 scripts/gen_service_tokens.py --rotate   # перевыпустить в
 
 | Что | Где | По умолчанию |
 | :-- | :-- | :-- |
-| Пароли БД: `POSTGRES_ADMIN_PASSWORD`, `AUTH_DB_PASSWORD`, `CHAT_DB_PASSWORD`, `LIBRARY_DB_PASSWORD`, `GRAPH_DB_PASSWORD` | `.env` | предсказуемые значения из примера |
+| Пароли БД: `POSTGRES_ADMIN_PASSWORD`, `AUTH_DB_PASSWORD`, `CHAT_DB_PASSWORD`, `LIBRARY_DB_PASSWORD`, `INGEST_DB_PASSWORD`, `GRAPH_DB_PASSWORD`, `DBSVC_DB_PASSWORD` | `.env` | предсказуемые значения из примера |
 | `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `.env` | `minioadmin`-подобные |
 | `DBSVC_ADMIN_TOKEN` | `.env` и `services/db-svc/.env` (должны совпадать) | `123456` |
 | `SECRET_KEY` (подпись JWT) | `services/auth-svc/.env` | заглушка из примера |
@@ -73,7 +73,8 @@ python3 scripts/gen_service_tokens.py --rotate   # перевыпустить в
 | `ADMIN_SESSION_COOKIE_SECURE=true` | `services/auth-svc/.env` | `false`; включать при HTTPS |
 
 Пароль БД, меняемый после первого запуска, нужно менять и в самой базе: init-скрипты
-исполняются только на пустом томе.
+исполняются только на пустом томе. Для этого есть `infra/db/init/roles/sync.sql` (команда в
+`infra/db/README.md`): он приводит пароли и права к значениям из `.env`.
 
 ### 3.4. Профили и модели
 
@@ -116,6 +117,20 @@ docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB
 
 Миграции 006 (очередь индексации) и 007 (`core.vector_column_dimension`) нужны **до**
 запуска новых версий `ingest-worker` и `graph-rag-svc`.
+
+Миграция 008 (роли и журнал действий) переводит базу на отдельные роли сервисов: у `ingest-worker`
+и `db-svc` появляются свои, а у остальных права сужаются до нужного. Перед ней добавьте в
+корневой `.env` `INGEST_DB_*` и `DBSVC_DB_*` (образец — `.env.example`), пересоздайте postgres,
+затем:
+
+```bash
+docker compose up -d postgres
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f -' \
+  < infra/db/migrations/008_roles_and_audit.sql
+docker compose up -d
+```
+
+Проверить результат: `infra/db/tests/check_roles.sh`. Подробности — `infra/db/README.md`.
 
 ## 5. Первичное наполнение
 

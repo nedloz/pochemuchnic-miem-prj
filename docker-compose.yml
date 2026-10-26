@@ -76,7 +76,14 @@ services:
       CHAT_DB_PASSWORD: ${CHAT_DB_PASSWORD}
       LIBRARY_DB_USER: ${LIBRARY_DB_USER}
       LIBRARY_DB_PASSWORD: ${LIBRARY_DB_PASSWORD}
-      # пользователей может быть больше надо перепроверить
+      GRAPH_DB_USER: ${GRAPH_DB_USER}
+      GRAPH_DB_PASSWORD: ${GRAPH_DB_PASSWORD}
+      INGEST_DB_USER: ${INGEST_DB_USER}
+      INGEST_DB_PASSWORD: ${INGEST_DB_PASSWORD}
+      DBSVC_DB_USER: ${DBSVC_DB_USER}
+      DBSVC_DB_PASSWORD: ${DBSVC_DB_PASSWORD}
+      # Эти переменные читает infra/db/init/roles/vars.sql при создании ролей. Список
+      # ролей и их права — infra/db/README.md.
     # Порт наружу не публикуется: наружу должен смотреть только nginx, всё остальное —
     # только внутри app-network. Для локального psql используйте `docker compose exec postgres psql ...`.
     # ports:
@@ -362,8 +369,9 @@ services:
     env_file:
       - ./services/db-svc/.env
     environment:
-      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      # Своя роль без прав владельца и DDL (infra/db/init/roles), а не суперпользователь.
+      POSTGRES_USER: ${DBSVC_DB_USER}
+      POSTGRES_PASSWORD: ${DBSVC_DB_PASSWORD}
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
       POSTGRES_DB: ${POSTGRES_DB}
