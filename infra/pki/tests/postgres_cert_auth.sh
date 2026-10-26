@@ -21,7 +21,7 @@ check_not() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail=$((fail+1));
 
 cleanup() {
     docker rm -f "$PKI_CA_CONTAINER" "$PG" "$P-renewer" >/dev/null 2>&1
-    docker volume rm -f "$PKI_CA_VOLUME" "${P}_srv" "${P}_dbsvc" "${P}_auth" "${P}_other" >/dev/null 2>&1
+    docker volume rm -f "$PKI_CA_VOLUME" "${P}_srv" "${P}_dbsvc" "${P}_auth" "${P}_other" "${P}_library" "${P}_ingest" "${P}_graph" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
     rm -rf "$TMP"
 }
@@ -42,14 +42,17 @@ enroll() { "$REPO_ROOT/scripts/pki/enroll.sh" "$@" >/dev/null 2>&1; }
 enroll postgres --uid 999 --gid 999 --volume "${P}_srv" || { echo "ПРОВАЛ  сертификат сервера"; exit 1; }
 enroll dbsvc_user --volume "${P}_dbsvc"
 enroll auth_user --volume "${P}_auth"
-enroll chat_user --volume "${P}_other"   # сертификат другой роли
+enroll chat_user --volume "${P}_other"   # сертификат другой роли (он же клиентский сертификат chat-svc)
+enroll library_user --volume "${P}_library"
+enroll ingest_user --volume "${P}_ingest"
+enroll graph_user --volume "${P}_graph"
 
 echo "== Postgres (dbsvc_user — cert, auth_user — password)"
 docker run -d --name "$PG" --network "$NET" --network-alias postgres \
     -e POSTGRES_DB=app_db -e POSTGRES_USER=app_user -e POSTGRES_PASSWORD=adminpw-test \
-    -e AUTH_DB_PASSWORD=pw-auth -e CHAT_DB_PASSWORD=pw-chat -e LIBRARY_DB_PASSWORD=pw-library \
-    -e INGEST_DB_PASSWORD=pw-ingest -e GRAPH_DB_PASSWORD=pw-graph \
-    -e DBSVC_DB_AUTH=cert -e CHAT_DB_AUTH=cert \
+    -e AUTH_DB_PASSWORD=pw-auth \
+    -e INGEST_DB_PASSWORD= -e GRAPH_DB_PASSWORD= -e LIBRARY_DB_PASSWORD= -e CHAT_DB_PASSWORD= \
+    -e DBSVC_DB_AUTH=cert -e CHAT_DB_AUTH=cert -e LIBRARY_DB_AUTH=cert -e INGEST_DB_AUTH=cert -e GRAPH_DB_AUTH=cert \
     -v "$REPO_ROOT/infra/db/init:/docker-entrypoint-initdb.d:ro" \
     -v "$REPO_ROOT/infra/db/pg_hba.pki.conf:/etc/postgresql/pg_hba.conf:ro" \
     -v "${P}_srv:/pki:ro" pgvector/pgvector:pg16 \
@@ -102,8 +105,8 @@ check_not "auth_user без пароля, только с сертификато
 check_not "открытое соединение (sslmode=disable) отвергнуто, даже с верным паролем" who auth_user pw-auth - disable srv
 check_not "суперпользователь по сети отвергнут" who app_user adminpw-test - require srv
 check "суперпользователь работает через сокет контейнера" test "$(local_sql 'SELECT current_user')" = app_user
-check "группы входа: pki_login = chat_user, dbsvc_user" test \
-    "$(local_sql "SELECT string_agg(u.rolname, ',' ORDER BY u.rolname) FROM pg_auth_members m JOIN pg_roles g ON g.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE g.rolname='pki_login'")" = chat_user,dbsvc_user
+check "группы входа: pki_login = cert-роли" test \
+    "$(local_sql "SELECT string_agg(u.rolname, ',' ORDER BY u.rolname) FROM pg_auth_members m JOIN pg_roles g ON g.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE g.rolname='pki_login'")" = chat_user,dbsvc_user,graph_user,ingest_user,library_user
 
 echo "== смена режима роли через sync.sql"
 sync_with() { docker exec -i "$@" "$PG" psql -U app_user -d app_db -v ON_ERROR_STOP=1 -q -f /docker-entrypoint-initdb.d/roles/sync.sql; }
@@ -146,5 +149,85 @@ else
     echo "пропущено: нет образа $IMG (docker compose build db-svc)"
 fi
 
+echo "== сервисы: собственное подключение к БД (app/pg_tls.py в каждом репозитории)"
+# Код сервиса из рабочей копии подставляется в образ; запрос идёт через ЕГО движок, а не через
+# отдельный клиент, поэтому проверяется именно то, что запустится в стеке.
+svc_engine() { # сервис, каталог кода в образе, том сертификата|-, DATABASE_URL-переменная, URL, [ещё -e ...]
+    local svc=$1 codedir=$2 vol=$3 urlvar=$4 url=$5; shift 5
+    local mounts=(-v "$REPO_ROOT/services/$svc/app:$codedir/app")
+    local env=(-e PYTHONDONTWRITEBYTECODE=1 -e "$urlvar=$url")
+    if [[ $vol != - ]]; then
+        mounts+=(-v "$vol:/pki:ro")
+        env+=(-e POSTGRES_SSLCERT=/pki/tls.crt -e POSTGRES_SSLKEY=/pki/tls.key -e POSTGRES_SSLROOTCERT=/pki/root_ca.crt)
+    fi
+    docker run --rm -i --network "$NET" "${mounts[@]}" "${env[@]}" "$@" "main-$svc" python - 2>&1 <<'PY'
+import asyncio, os, sys
+sys.path.insert(0, os.getcwd())
+from sqlalchemy import text
+mod = os.environ["SVC_ENGINE_MODULE"]
+engine = __import__(mod, fromlist=["engine"]).engine
+query = os.environ["SVC_QUERY"]
+async def main():
+    async with engine.connect() as c:
+        row = (await c.execute(text(query))).one()
+    # второе соединение: пул открывает новые, и контекст TLS собирается заново
+    async with engine.connect() as c:
+        await c.execute(text("select 1"))
+    print("RESULT", *row)
+asyncio.run(main())
+PY
+}
+res() { printf '%s\n' "$1" >> "$TMP/svc.log"; grep -o 'RESULT.*' <<<"$1" | head -1; }
+PGHOST_URL() { echo "postgresql+asyncpg://$1@postgres:5432/app_db"; }
+
+out="$(svc_engine auth-svc /app - DATABASE_URL "$(PGHOST_URL auth_user)" -e PGPASSWORD=pw-auth -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user, (select count(*) from auth.users)")"
+check "auth-svc (режим password, без сертификата): вход по паролю" test "$(res "$out" | cut -d' ' -f1-2)" = "RESULT auth_user"
+
+out="$(svc_engine library-svc /code "${P}_library" DATABASE_URL "$(PGHOST_URL library_user)" -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user, (select count(*) from library.documents)")"
+check "library-svc: вход по сертификату" test "$(res "$out" | cut -d' ' -f1-2)" = "RESULT library_user"
+
+out="$(svc_engine chat-svc /app "${P}_other" POSTGRES_URL "$(PGHOST_URL chat_user)" -e SVC_ENGINE_MODULE=app.db.session -e "SVC_QUERY=select current_user, (select count(*) from chat.chat_sessions)")"
+check "chat-svc: вход по сертификату" test "$(res "$out" | cut -d' ' -f1-2)" = "RESULT chat_user"
+
+out="$(svc_engine graph-rag-svc /app "${P}_graph" DATABASE_URL "$(PGHOST_URL graph_user)" -e SVC_ENGINE_MODULE=app.db.session -e "SVC_QUERY=select current_user, (select count(*) from graph.entities)")"
+check "graph-rag-svc: вход по сертификату" test "$(res "$out" | cut -d' ' -f1-2)" = "RESULT graph_user"
+
+# ingest-worker: движок и отдельное LISTEN-соединение (оба предъявляют сертификат)
+out="$(docker run --rm -i --network "$NET" -v "$REPO_ROOT/services/ingest-worker/app:/app/app" -v "${P}_ingest:/pki:ro" \
+    -e PYTHONDONTWRITEBYTECODE=1 -e DATABASE_URL="$(PGHOST_URL ingest_user)" -e EMBEDDING_DIM=1024 \
+    -e POSTGRES_SSLCERT=/pki/tls.crt -e POSTGRES_SSLKEY=/pki/tls.key -e POSTGRES_SSLROOTCERT=/pki/root_ca.crt \
+    main-ingest-worker python - 2>&1 <<'PY'
+import asyncio, sys
+sys.path.insert(0, "/app/app")
+import main as w
+from sqlalchemy import text
+async def go():
+    async with w.engine.connect() as c:
+        who = (await c.execute(text("select current_user"))).scalar()
+    sig = w.JobSignal()
+    await sig.connect()
+    print("RESULT", who, "listen", sig.connected)
+asyncio.run(go())
+PY
+)"
+check "ingest-worker: вход по сертификату (движок и LISTEN): ${out##*$'\n'}" test "$(res "$out")" = "RESULT ingest_user listen True"
+
+# Обновлённый сертификат подхватывается новыми соединениями без перезапуска сервиса
+docker run --rm --user 0 --entrypoint "" --network "$NET" -v "${P}_library:/certs" "$STEP_IMAGE" \
+    step ca renew --force --ca-url https://step-ca:9000 --root /certs/root_ca.crt /certs/tls.crt /certs/tls.key >/dev/null 2>&1
+out="$(svc_engine library-svc /code "${P}_library" DATABASE_URL "$(PGHOST_URL library_user)" -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user")"
+check "library-svc входит и с обновлённым сертификатом" test "$(res "$out")" = "RESULT library_user"
+
+# Сервис без сертификата в окружении (override не подключён) не ломается: пароль, как раньше
+sync_with -e AUTH_DB_AUTH=password -e AUTH_DB_PASSWORD=pw-auth >/dev/null 2>&1
+out="$(svc_engine auth-svc /app - DATABASE_URL "postgresql+asyncpg://auth_user:pw-auth@postgres:5432/app_db" -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user")"
+check "auth-svc с паролем в URL (override не используется)" test "$(res "$out")" = "RESULT auth_user"
+sync_with -e AUTH_DB_AUTH=cert >/dev/null 2>&1
+out="$(svc_engine auth-svc /app "${P}_auth" DATABASE_URL "$(PGHOST_URL auth_user)" -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user")"
+check "auth-svc: вход по сертификату после перевода роли в cert" test "$(res "$out")" = "RESULT auth_user"
+out="$(svc_engine auth-svc /app "${P}_other" DATABASE_URL "$(PGHOST_URL auth_user)" -e SVC_ENGINE_MODULE=app.database -e "SVC_QUERY=select current_user")"
+check_not "auth-svc с сертификатом другой роли отвергнут" test "$(res "$out")" = "RESULT auth_user"
+
+if [[ -n "${SELFTEST_DEBUG:-}" && -f "$TMP/svc.log" ]]; then echo "--- вывод проверок сервисов:"; cat "$TMP/svc.log"; fi
 printf '\nИтого: %d проверок пройдено, %d провалено\n' "$pass" "$fail"
 exit "$fail"

@@ -142,35 +142,43 @@ db-svc есть сквозная проверка приложения на жи
 Режим каждой роли задаёт `*_DB_AUTH` в корневом `.env` (`password` по умолчанию, `cert`), его
 применяет `roles/create_roles.sql`: при `cert` роль теряет пароль и попадает в `pki_login`.
 
-**Включение для db-svc** (остальные сервисы пока на паролях, см. ниже):
+**Включение.** Можно сразу для всех сервисов или по одному: роли без `*_DB_AUTH=cert`
+продолжают входить по паролю.
 
 ```bash
 scripts/pki/init.sh
 docker compose --profile pki up -d step-ca
 scripts/pki/enroll.sh postgres --uid 999 --gid 999     # сертификат сервера (999 — пользователь postgres)
-scripts/pki/enroll.sh dbsvc_user                       # клиентский сертификат: CN = имя роли
-echo "DBSVC_DB_AUTH=cert" >> .env
-echo "COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml" >> .env
+for role in auth_user chat_user library_user ingest_user graph_user dbsvc_user; do
+    scripts/pki/enroll.sh "$role"                      # клиентские сертификаты: CN = имя роли
+done
+# в корневой .env: *_DB_AUTH=cert для нужных ролей (AUTH, CHAT, LIBRARY, INGEST, GRAPH, DBSVC)
+# и COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml
 docker compose --profile pki up -d postgres
 docker compose exec -T postgres psql -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DB" \
-    -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/roles/sync.sql     # создаёт группы, снимает пароль
+    -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/roles/sync.sql     # создаёт группы, снимает пароли
 docker compose --profile pki up -d
 ```
 
-Контейнеры `postgres-certs` и `dbsvc_user-certs` из override обновляют сертификаты; первый после
-каждого обновления посылает Postgres `SIGHUP`, чтобы тот перечитал серверный сертификат.
-db-svc сам обновляет свой: libpq читает файлы при каждом соединении.
+После этого `*_DB_PASSWORD` в `.env` у ролей в режиме `cert` можно очистить: они не используются.
+Контейнеры `*-db-certs` из override обновляют клиентские сертификаты, `postgres-certs` обновляет
+серверный и после каждого обновления посылает Postgres `SIGHUP`, чтобы тот перечитал файл.
 
-Сервис читает сертификат из переменных `POSTGRES_SSLCERT`, `POSTGRES_SSLKEY`,
-`POSTGRES_SSLROOTCERT` (и по желанию `POSTGRES_SSLMODE`, по умолчанию `verify-full`); без
-`POSTGRES_SSLCERT` он использует пароль, как раньше.
+**Как сервисы предъявляют сертификат.** Override задаёт `POSTGRES_SSLCERT`, `POSTGRES_SSLKEY`,
+`POSTGRES_SSLROOTCERT` и подставляет `DATABASE_URL` без пароля (пароль для ролей в режиме
+`password` приходит через `PGPASSWORD`).
 
-**Чтобы перевести остальные сервисы**, нужно научить их предъявлять сертификат: их драйвер
-(asyncpg через SQLAlchemy) принимает его только как `ssl.SSLContext` в `connect_args`, из URL
-этого не сделать. Это одинаковая небольшая правка в `auth-svc`, `chat-svc`, `library-svc`,
-`ingest-worker` (и его отдельное LISTEN-соединение) и `graph-rag-svc`. После неё в `.env` для
-роли ставится `*_DB_AUTH=cert`, выпускается сертификат на имя роли, и в `pg_hba.pki.conf`
-остаётся только строка `+pki_login`.
+- `db-svc` (libpq/psycopg) читает файлы при каждом соединении; `POSTGRES_SSLMODE` по умолчанию
+  `verify-full`.
+- `auth-svc`, `chat-svc`, `library-svc`, `ingest-worker`, `graph-rag-svc` (asyncpg через
+  SQLAlchemy) используют одинаковый модуль `app/pg_tls.py`: он создаёт движок со своим
+  `async_creator` и собирает контекст TLS **заново для каждого нового соединения**. Контекст,
+  прочитанный один раз, продолжал бы предъявлять истёкший сертификат всем новым соединениям
+  пула. `ingest-worker` так же подключает отдельное LISTEN-соединение. Модуль лежит в каждом
+  репозитории отдельной копией (общего кода у сервисов нет), менять его нужно во всех сразу.
+- Без `POSTGRES_SSLCERT` все сервисы работают как раньше, по паролю из URL.
+
+После перевода всех сервисов строку `+pw_login` в `pg_hba.pki.conf` можно удалить.
 
 **Проверка**: `infra/pki/tests/postgres_cert_auth.sh` поднимает одноразовые CA и Postgres и
 проверяет вход по сертификату, отказ по паролю и по чужому сертификату, переключение режима,
@@ -178,8 +186,8 @@ db-svc сам обновляет свой: libpq читает файлы при 
 
 ## Что осталось и почему
 
-- **Пароли.** Сервисы, кроме db-svc, пока входят по паролю (по TLS, если включён
-  `docker-compose.pki.yml`). Перевод требует правки подключения в каждом сервисе (см. выше).
+- **Пароли.** По умолчанию роли входят по паролю: режим `cert` включается вручную (см. выше),
+  потому что требует CA и выданных сертификатов.
 - **`pg_hba` образа** по умолчанию разрешает `trust` на loopback и сокете внутри контейнера
   postgres; с `docker-compose.pki.yml` остаётся только сокет внутри контейнера.
 - **Построчная защита (RLS) для `chat`** не делалась. Она защищает от забытого `WHERE user_id`

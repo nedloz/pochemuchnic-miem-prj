@@ -8,10 +8,28 @@
 #   scripts/pki/init.sh
 #   docker compose --profile pki up -d step-ca
 #   scripts/pki/enroll.sh postgres --uid 999 --gid 999            # сертификат сервера
-#   scripts/pki/enroll.sh dbsvc_user                              # сертификат клиента: CN = имя роли
-#   и DBSVC_DB_AUTH=cert в .env, затем sync.sql (infra/db/README.md)
+#   scripts/pki/enroll.sh auth_user                               # клиентские сертификаты: CN = имя роли
+#   (так же chat_user, library_user, ingest_user, graph_user, dbsvc_user)
+#   и *_DB_AUTH=cert в .env, затем sync.sql (infra/db/README.md)
 #
 # Без этого файла стек работает как раньше: пароли, открытое соединение.
+
+# Обновляющий контейнер одинаков для всех сертификатов (infra/pki/renewer.sh).
+x-pki-renewer: &pki-renewer
+  image: smallstep/step-ca:0.30.2
+  profiles: ["pki"]
+  restart: unless-stopped
+  user: "0"
+  entrypoint: ["/bin/sh", "/renewer.sh"]
+  networks:
+    - pki-net
+
+# Как сервисы находят свой клиентский сертификат. Читается app/pg_tls.py (asyncpg-сервисы)
+# и app/services/pg.py (db-svc, libpq). Том со своим сертификатом монтируется в /pki.
+x-pki-client-env: &pki-client-env
+  POSTGRES_SSLCERT: /pki/tls.crt
+  POSTGRES_SSLKEY: /pki/tls.key
+  POSTGRES_SSLROOTCERT: /pki/root_ca.crt
 
 services:
   postgres:
@@ -61,34 +79,107 @@ services:
     networks:
       - pki-net
 
+  # --- Клиенты. DATABASE_URL без пароля: для роли в режиме cert пароль не нужен, а для роли
+  # в режиме password его подставляет PGPASSWORD (asyncpg читает его сам).
+
+  auth-svc:
+    environment:
+      <<: *pki-client-env
+      DATABASE_URL: postgresql+asyncpg://${AUTH_DB_USER}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+      PGPASSWORD: ${AUTH_DB_PASSWORD:-}
+    volumes:
+      - pki_certs_auth:/pki:ro
+
+  chat-svc:
+    environment:
+      <<: *pki-client-env
+      POSTGRES_URL: postgresql+asyncpg://${CHAT_DB_USER}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+      PGPASSWORD: ${CHAT_DB_PASSWORD:-}
+    volumes:
+      - pki_certs_chat:/pki:ro
+
+  library-svc:
+    environment:
+      <<: *pki-client-env
+      DATABASE_URL: postgresql+asyncpg://${LIBRARY_DB_USER}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+      PGPASSWORD: ${LIBRARY_DB_PASSWORD:-}
+    volumes:
+      - pki_certs_library:/pki:ro
+
+  ingest-worker:
+    environment:
+      <<: *pki-client-env
+      DATABASE_URL: postgresql+asyncpg://${INGEST_DB_USER}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+      PGPASSWORD: ${INGEST_DB_PASSWORD:-}
+    volumes:
+      - pki_certs_ingest:/pki:ro
+
+  graph-rag-svc:
+    environment:
+      <<: *pki-client-env
+      DATABASE_URL: postgresql+asyncpg://${GRAPH_DB_USER}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+      PGPASSWORD: ${GRAPH_DB_PASSWORD:-}
+    volumes:
+      - pki_certs_graph:/pki:ro
+
   db-svc:
     environment:
-      # Вход по сертификату вместо пароля (роль в Postgres должна быть в режиме cert).
-      POSTGRES_SSLCERT: /pki/tls.crt
-      POSTGRES_SSLKEY: /pki/tls.key
-      POSTGRES_SSLROOTCERT: /pki/root_ca.crt
+      <<: *pki-client-env
     volumes:
-      - pki_certs_dbsvc_user:/pki:ro
+      - pki_certs_dbsvc:/pki:ro
 
-  dbsvc_user-certs:
-    image: smallstep/step-ca:0.30.2
-    container_name: dbsvc_user-certs
-    profiles: ["pki"]
-    restart: unless-stopped
-    user: "0"
-    entrypoint: ["/bin/sh", "/renewer.sh"]
-    environment:
-      CA_URL: https://step-ca:9000
-    volumes:
-      - pki_certs_dbsvc_user:/certs
-      - ./infra/pki/renewer.sh:/renewer.sh:ro
-    networks:
-      - pki-net
+  # --- Обновление клиентских сертификатов. Постоянно работающий контейнер на каждую роль.
 
+  auth-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_auth:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+  chat-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_chat:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+  library-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_library:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+  ingest-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_ingest:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+  graph-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_graph:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+  dbsvc-db-certs:
+    <<: *pki-renewer
+    environment: { CA_URL: "https://step-ca:9000" }
+    volumes: [ "pki_certs_dbsvc:/certs", "./infra/pki/renewer.sh:/renewer.sh:ro" ]
+
+# Тома создаёт scripts/pki/enroll.sh; имена содержат имя роли в БД (оно же CN сертификата).
 volumes:
   pki_certs_postgres:
     external: true
     name: pki_certs_postgres
-  pki_certs_dbsvc_user:
+  pki_certs_auth:
     external: true
-    name: pki_certs_dbsvc_user
+    name: pki_certs_${AUTH_DB_USER:-auth_user}
+  pki_certs_chat:
+    external: true
+    name: pki_certs_${CHAT_DB_USER:-chat_user}
+  pki_certs_library:
+    external: true
+    name: pki_certs_${LIBRARY_DB_USER:-library_user}
+  pki_certs_ingest:
+    external: true
+    name: pki_certs_${INGEST_DB_USER:-ingest_user}
+  pki_certs_graph:
+    external: true
+    name: pki_certs_${GRAPH_DB_USER:-graph_user}
+  pki_certs_dbsvc:
+    external: true
+    name: pki_certs_${DBSVC_DB_USER:-dbsvc_user}
