@@ -1,0 +1,168 @@
+# Дополнение к docker-compose.yml: взаимная TLS-аутентификация (mTLS) между сервисами.
+# Закрывает graph-rag-svc и embedding-svc: к ним можно обратиться только с клиентским
+# сертификатом внутреннего CA, а что именно вызывающему можно, решает его CN
+# (infra/mtls/*.conf). Статические токены X-Service-Token остаются вторым слоем.
+#
+#   chat-svc ──► graph-rag-svc   /generate, /cancel
+#   db-svc   ──► graph-rag-svc   /internal/graph/*
+#   graph-rag-svc, ingest-worker ──► embedding-svc   /embed, /ping
+#
+# Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
+#
+# Предварительно выпустить сертификаты сервисов (имя = идентичность = CN):
+#   for s in chat-svc db-svc graph-rag-svc embedding-svc ingest-worker; do scripts/pki/enroll.sh "$s"; done
+# Подробности: infra/pki/README.md, раздел «mTLS между сервисами».
+#
+# Как это устроено. Рядом с получателем работает прокси (nginx) в ТОМ ЖЕ сетевом пространстве
+# (network_mode: service:...). Само приложение переводится на 127.0.0.1, поэтому до него нельзя
+# достучаться напрямую из другого контейнера: открыт только порт 8443 прокси с проверкой
+# сертификата. Вызывающие ходят на https://<сервис>:8443 и предъявляют свой сертификат.
+# Без этого файла стек работает как раньше.
+
+x-mtls-renewer: &mtls-renewer
+  image: smallstep/step-ca:0.30.2
+  profiles: ["pki"]
+  restart: unless-stopped
+  user: "0"
+  entrypoint: ["/bin/sh", "/renewer.sh"]
+  healthcheck:
+    disable: true
+  networks:
+    - pki-net
+
+# Как вызывающий сервис находит свой клиентский сертификат (app/mtls.py в каждом сервисе).
+x-mtls-client-env: &mtls-client-env
+  SERVICE_MTLS_CERT: /pki-svc/tls.crt
+  SERVICE_MTLS_KEY: /pki-svc/tls.key
+  SERVICE_MTLS_CA: /pki-svc/root_ca.crt
+
+services:
+  # --- получатели: приложение слушает только localhost, снаружи — прокси ---
+
+  graph-rag-svc:
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+    environment:
+      <<: *mtls-client-env
+      EMBEDDING_SVC_URL: https://embedding-svc:8443
+    volumes:
+      - mtls_graph-rag-svc:/pki-svc:ro
+
+  graph-rag-svc-mtls:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    network_mode: "service:graph-rag-svc"
+    depends_on:
+      graph-rag-svc:
+        condition: service_started
+        # пересоздали получателя через compose — пересоздаётся и прокси в его пространстве
+        restart: true
+    volumes:
+      - mtls_graph-rag-svc:/pki-svc:ro
+      - ./infra/mtls/graph-rag-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
+  graph-rag-svc-certs:
+    <<: *mtls-renewer
+    # Общее пространство процессов с прокси: после обновления сертификата он получает SIGHUP
+    # (PID 1 в его контейнере) и перечитывает файлы.
+    pid: "service:graph-rag-svc-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_graph-rag-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  embedding-svc:
+    command: ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"]
+    volumes:
+      - mtls_embedding-svc:/pki-svc:ro
+
+  embedding-svc-mtls:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    network_mode: "service:embedding-svc"
+    depends_on:
+      embedding-svc:
+        condition: service_started
+        # пересоздали получателя через compose — пересоздаётся и прокси в его пространстве
+        restart: true
+    volumes:
+      - mtls_embedding-svc:/pki-svc:ro
+      - ./infra/mtls/embedding-svc.conf:/etc/nginx/conf.d/default.conf:ro
+
+  embedding-svc-certs:
+    <<: *mtls-renewer
+    pid: "service:embedding-svc-mtls"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_embedding-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  # --- вызывающие: свой сертификат и адреса по https ---
+
+  chat-svc:
+    environment:
+      <<: *mtls-client-env
+      LLM_STREAM_URL: https://graph-rag-svc:8443/generate
+      LLM_CANCEL_URL: https://graph-rag-svc:8443/cancel
+    volumes:
+      - mtls_chat-svc:/pki-svc:ro
+
+  chat-svc-certs:
+    <<: *mtls-renewer
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_chat-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  db-svc:
+    environment:
+      <<: *mtls-client-env
+      GRAPH_RAG_URL: https://graph-rag-svc:8443
+    volumes:
+      - mtls_db-svc:/pki-svc:ro
+
+  db-svc-certs:
+    <<: *mtls-renewer
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_db-svc:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+  ingest-worker:
+    environment:
+      <<: *mtls-client-env
+      EMBEDDING_SVC_URL: https://embedding-svc:8443
+    volumes:
+      - mtls_ingest-worker:/pki-svc:ro
+
+  ingest-worker-certs:
+    <<: *mtls-renewer
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_ingest-worker:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
+# Тома создаёт scripts/pki/enroll.sh; имя тома = pki_certs_<идентичность>.
+volumes:
+  mtls_graph-rag-svc:
+    external: true
+    name: pki_certs_graph-rag-svc
+  mtls_embedding-svc:
+    external: true
+    name: pki_certs_embedding-svc
+  mtls_chat-svc:
+    external: true
+    name: pki_certs_chat-svc
+  mtls_db-svc:
+    external: true
+    name: pki_certs_db-svc
+  mtls_ingest-worker:
+    external: true
+    name: pki_certs_ingest-worker

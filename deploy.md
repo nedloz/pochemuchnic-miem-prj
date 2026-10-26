@@ -161,6 +161,11 @@ scripts/pki/enroll.sh <имя-сервиса>
 Срок жизни сертификатов — `PKI_CERT_TTL` в `.env` (по умолчанию `24h`). Подробности и проверка —
 `infra/pki/README.md`.
 
+Поверх него `docker-compose.mtls.yml` закрывает graph-rag-svc и embedding-svc взаимной TLS-аутентификацией
+(вызывать их могут только chat-svc, db-svc, ingest-worker и graph-rag-svc, и только то, что разрешено в
+`infra/mtls/*.conf`). Включать, когда embedding-svc запущен; порядок — в `infra/pki/README.md`, раздел
+«mTLS между сервисами».
+
 ## 5. Первичное наполнение
 
 1. Откройте `http://<хост>:<NGINX_PORT>`, войдите администратором `admin@edu.hse.ru` / `admin`
