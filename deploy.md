@@ -132,6 +132,20 @@ docker compose up -d
 
 Проверить результат: `infra/db/tests/check_roles.sh`. Подробности — `infra/db/README.md`.
 
+### Внутренний центр сертификации (необязательно)
+
+Профиль compose `pki` поднимает `step-ca`: он выдаёт сервисам короткоживущие сертификаты для
+взаимной TLS-аутентификации. Обычный запуск стека его не включает.
+
+```bash
+scripts/pki/init.sh                              # один раз; увезите pki/root/ с машины
+docker compose --profile pki up -d step-ca
+scripts/pki/enroll.sh <имя-сервиса>
+```
+
+Срок жизни сертификатов — `PKI_CERT_TTL` в `.env` (по умолчанию `24h`). Подробности и проверка —
+`infra/pki/README.md`.
+
 ## 5. Первичное наполнение
 
 1. Откройте `http://<хост>:<NGINX_PORT>`, войдите администратором `admin@edu.hse.ru` / `admin`

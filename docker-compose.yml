@@ -101,6 +101,32 @@ services:
       retries: 20
 
 
+  # Внутренний центр сертификации (step-ca). Включается профилем pki:
+  #   docker compose --profile pki up -d step-ca
+  # Перед первым запуском выполните scripts/pki/init.sh (создаёт корень, промежуточный
+  # сертификат и конфигурацию в томе step_ca_data). Описание — infra/pki/README.md.
+  step-ca:
+    image: smallstep/step-ca:0.30.2
+    container_name: step-ca
+    profiles: ["pki"]
+    restart: unless-stopped
+    # Своя точка входа применяет PKI_CERT_TTL к конфигурации перед запуском.
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      PKI_CERT_TTL: ${PKI_CERT_TTL:-24h}
+    volumes:
+      - step_ca_data:/home/step
+      - ./infra/pki/entrypoint.sh:/entrypoint.sh:ro
+    # Порт наружу не публикуется: к CA ходят только сервисы из pki-net.
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/home/step/certs/root_ca.crt"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      - pki-net
+
   redis:
     image: redis:7
     container_name: redis
@@ -406,6 +432,7 @@ volumes:
   graph_rag_hf_cache:
   ollama_data:
   pip_cache:
+  step_ca_data:
 
 networks:
   app-network:
@@ -415,4 +442,8 @@ networks:
     driver: bridge
 
   library-backend:
+    driver: bridge
+
+  # Сеть центра сертификации: в ней только step-ca и те, кто получает у него сертификаты.
+  pki-net:
     driver: bridge
