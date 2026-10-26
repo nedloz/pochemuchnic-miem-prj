@@ -33,5 +33,22 @@
 \getenv graph_pass   GRAPH_DB_PASSWORD
 \getenv dbsvc_pass   DBSVC_DB_PASSWORD
 
+-- Способ входа каждой роли: password (по умолчанию) или cert. В режиме cert у роли нет пароля,
+-- а подлинность подтверждает клиентский сертификат, CN которого равен имени роли
+-- (infra/pki/README.md, infra/db/pg_hba.pki.conf). Режим действует, когда Postgres запущен
+-- с docker-compose.pki.yml; без него роли входят по паролю независимо от значения.
+\getenv auth_mode    AUTH_DB_AUTH
+\if :{?auth_mode}    \else \set auth_mode    password \endif
+\getenv chat_mode    CHAT_DB_AUTH
+\if :{?chat_mode}    \else \set chat_mode    password \endif
+\getenv library_mode LIBRARY_DB_AUTH
+\if :{?library_mode} \else \set library_mode password \endif
+\getenv ingest_mode  INGEST_DB_AUTH
+\if :{?ingest_mode}  \else \set ingest_mode  password \endif
+\getenv graph_mode   GRAPH_DB_AUTH
+\if :{?graph_mode}   \else \set graph_mode   password \endif
+\getenv dbsvc_mode   DBSVC_DB_AUTH
+\if :{?dbsvc_mode}   \else \set dbsvc_mode   password \endif
+
 -- Роли-владельцы и группы фиксированы: от их имён зависят права, а настраивать тут нечего.
 \set owner_role app_owner

@@ -15,8 +15,22 @@
 
 \i /docker-entrypoint-initdb.d/roles/vars.sql
 
--- Все шесть паролей обязательны. Без этой проверки отсутствующая переменная превратилась бы
--- в непонятную синтаксическую ошибку, а пустой пароль — в роль без пароля.
+-- Режим входа — password или cert. Опечатка («certs», «Cert») молча оставила бы роль с
+-- паролем, хотя оператор рассчитывал на вход по сертификату.
+SELECT EXISTS (
+    SELECT 1
+    FROM (VALUES (:'auth_mode'), (:'chat_mode'), (:'library_mode'), (:'ingest_mode'),
+                 (:'graph_mode'), (:'dbsvc_mode')) AS v(mode)
+    WHERE v.mode NOT IN ('password', 'cert')
+) AS bad_mode \gset
+\if :bad_mode
+DO $$ BEGIN
+    RAISE EXCEPTION 'Способ входа роли должен быть password или cert (переменные *_DB_AUTH).';
+END $$;
+\endif
+
+-- Пароль обязателен у ролей в режиме password. Без этой проверки отсутствующая переменная
+-- превратилась бы в непонятную синтаксическую ошибку, а пустой пароль — в роль без пароля.
 \if :{?auth_pass} \else \set auth_pass '' \endif
 \if :{?chat_pass} \else \set chat_pass '' \endif
 \if :{?library_pass} \else \set library_pass '' \endif
@@ -24,13 +38,18 @@
 \if :{?graph_pass} \else \set graph_pass '' \endif
 \if :{?dbsvc_pass} \else \set dbsvc_pass '' \endif
 
-SELECT (:'auth_pass' = '' OR :'chat_pass' = '' OR :'library_pass' = ''
-        OR :'ingest_pass' = '' OR :'graph_pass' = '' OR :'dbsvc_pass' = '') AS has_empty_pass \gset
+SELECT EXISTS (
+    SELECT 1
+    FROM (VALUES (:'auth_mode', :'auth_pass'), (:'chat_mode', :'chat_pass'),
+                 (:'library_mode', :'library_pass'), (:'ingest_mode', :'ingest_pass'),
+                 (:'graph_mode', :'graph_pass'), (:'dbsvc_mode', :'dbsvc_pass')) AS v(mode, pass)
+    WHERE v.mode = 'password' AND v.pass = ''
+) AS has_empty_pass \gset
 \if :has_empty_pass
 DO $$ BEGIN
-    RAISE EXCEPTION 'Не заданы пароли ролей. Нужны непустые AUTH_DB_PASSWORD, CHAT_DB_PASSWORD, '
-                    'LIBRARY_DB_PASSWORD, INGEST_DB_PASSWORD, GRAPH_DB_PASSWORD, DBSVC_DB_PASSWORD '
-                    'в окружении контейнера postgres (корневой .env).';
+    RAISE EXCEPTION 'Не заданы пароли ролей в режиме password. Нужны непустые *_DB_PASSWORD '
+                    '(AUTH, CHAT, LIBRARY, INGEST, GRAPH, DBSVC) в окружении контейнера postgres '
+                    '(корневой .env) либо режим cert для этой роли (*_DB_AUTH=cert).';
 END $$;
 \endif
 
@@ -50,7 +69,8 @@ SELECT format('CREATE ROLE %I NOLOGIN', r)
 FROM unnest(ARRAY[
     'app_owner',
     'core_ro', 'core_rw', 'auth_ro', 'auth_rw', 'chat_ro', 'chat_rw',
-    'library_ro', 'library_rw', 'graph_ro', 'graph_rw', 'rag_ro', 'rag_rw'
+    'library_ro', 'library_rw', 'graph_ro', 'graph_rw', 'rag_ro', 'rag_rw',
+    'pki_login', 'pw_login'
 ]) AS r
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
 \gexec
@@ -64,18 +84,39 @@ FROM (VALUES (:'auth_user'), (:'chat_user'), (:'library_user'),
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v.name)
 \gexec
 
+-- В режиме cert пароль снимается совсем (PASSWORD NULL): вход по паролю становится невозможен
+-- не только по правилам pg_hba, но и по самой роли.
 SELECT format(
     'ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT '
-    'CONNECTION LIMIT %s PASSWORD %L',
-    v.name, v.conn_limit, v.pass)
+    'CONNECTION LIMIT %s %s',
+    v.name, v.conn_limit,
+    CASE WHEN v.mode = 'cert' THEN 'PASSWORD NULL' ELSE format('PASSWORD %L', v.pass) END)
 FROM (VALUES
-    (:'auth_user',    20, :'auth_pass'),
-    (:'chat_user',    30, :'chat_pass'),
-    (:'library_user', 20, :'library_pass'),
-    (:'ingest_user',  10, :'ingest_pass'),
-    (:'graph_user',   30, :'graph_pass'),
-    (:'dbsvc_user',   40, :'dbsvc_pass')
-) AS v(name, conn_limit, pass)
+    (:'auth_user',    20, :'auth_mode',    :'auth_pass'),
+    (:'chat_user',    30, :'chat_mode',    :'chat_pass'),
+    (:'library_user', 20, :'library_mode', :'library_pass'),
+    (:'ingest_user',  10, :'ingest_mode',  :'ingest_pass'),
+    (:'graph_user',   30, :'graph_mode',   :'graph_pass'),
+    (:'dbsvc_user',   40, :'dbsvc_mode',   :'dbsvc_pass')
+) AS v(name, conn_limit, mode, pass)
+\gexec
+
+-- Способ входа для pg_hba (infra/db/pg_hba.pki.conf выбирает правило по членству в группе).
+SELECT format('REVOKE %I FROM %I', g.stale, v.name)
+FROM (VALUES
+    (:'auth_user', :'auth_mode'), (:'chat_user', :'chat_mode'), (:'library_user', :'library_mode'),
+    (:'ingest_user', :'ingest_mode'), (:'graph_user', :'graph_mode'), (:'dbsvc_user', :'dbsvc_mode')
+) AS v(name, mode)
+CROSS JOIN LATERAL (SELECT CASE WHEN v.mode = 'cert' THEN 'pw_login' ELSE 'pki_login' END AS stale) g
+WHERE EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid JOIN pg_roles u ON u.oid = m.member
+              WHERE r.rolname = g.stale AND u.rolname = v.name)
+\gexec
+
+SELECT format('GRANT %I TO %I', CASE WHEN v.mode = 'cert' THEN 'pki_login' ELSE 'pw_login' END, v.name)
+FROM (VALUES
+    (:'auth_user', :'auth_mode'), (:'chat_user', :'chat_mode'), (:'library_user', :'library_mode'),
+    (:'ingest_user', :'ingest_mode'), (:'graph_user', :'graph_mode'), (:'dbsvc_user', :'dbsvc_mode')
+) AS v(name, mode)
 \gexec
 
 -- Группы и владелец входить в базу не могут и ничем, кроме прав, не обладают.
@@ -83,7 +124,8 @@ SELECT format('ALTER ROLE %I NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION N
 FROM unnest(ARRAY[
     'app_owner',
     'core_ro', 'core_rw', 'auth_ro', 'auth_rw', 'chat_ro', 'chat_rw',
-    'library_ro', 'library_rw', 'graph_ro', 'graph_rw', 'rag_ro', 'rag_rw'
+    'library_ro', 'library_rw', 'graph_ro', 'graph_rw', 'rag_ro', 'rag_rw',
+    'pki_login', 'pw_login'
 ]) AS r
 \gexec
 

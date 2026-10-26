@@ -1,0 +1,94 @@
+# Дополнение к docker-compose.yml: TLS в Postgres и вход сервисов по сертификатам.
+# Подключение:
+#   docker compose -f docker-compose.yml -f docker-compose.pki.yml --profile pki up -d
+# или постоянно, в корневом .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml
+#
+# Предварительно (infra/pki/README.md, infra/db/README.md):
+#   scripts/pki/init.sh
+#   docker compose --profile pki up -d step-ca
+#   scripts/pki/enroll.sh postgres --uid 999 --gid 999            # сертификат сервера
+#   scripts/pki/enroll.sh dbsvc_user                              # сертификат клиента: CN = имя роли
+#   и DBSVC_DB_AUTH=cert в .env, затем sync.sql (infra/db/README.md)
+#
+# Без этого файла стек работает как раньше: пароли, открытое соединение.
+
+services:
+  postgres:
+    environment:
+      # Способ входа каждой роли (password | cert), читает infra/db/init/roles/vars.sql.
+      AUTH_DB_AUTH: ${AUTH_DB_AUTH:-password}
+      CHAT_DB_AUTH: ${CHAT_DB_AUTH:-password}
+      LIBRARY_DB_AUTH: ${LIBRARY_DB_AUTH:-password}
+      INGEST_DB_AUTH: ${INGEST_DB_AUTH:-password}
+      GRAPH_DB_AUTH: ${GRAPH_DB_AUTH:-password}
+      DBSVC_DB_AUTH: ${DBSVC_DB_AUTH:-password}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/pki/tls.crt
+      - -c
+      - ssl_key_file=/pki/tls.key
+      # Корень, которым проверяются клиентские сертификаты. Промежуточный клиент присылает сам.
+      - -c
+      - ssl_ca_file=/pki/root_ca.crt
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - pki_certs_postgres:/pki:ro
+      - ./infra/db/pg_hba.pki.conf:/etc/postgresql/pg_hba.conf:ro
+
+  # Обновляет серверный сертификат и просит Postgres перечитать его. Общее пространство
+  # процессов с postgres позволяет послать SIGHUP его главному процессу (PID 1 там).
+  postgres-certs:
+    image: smallstep/step-ca:0.30.2
+    container_name: postgres-certs
+    profiles: ["pki"]
+    restart: unless-stopped
+    user: "0"
+    pid: "service:postgres"
+    entrypoint: ["/bin/sh", "/renewer.sh"]
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - pki_certs_postgres:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+    depends_on:
+      - postgres
+    networks:
+      - pki-net
+
+  db-svc:
+    environment:
+      # Вход по сертификату вместо пароля (роль в Postgres должна быть в режиме cert).
+      POSTGRES_SSLCERT: /pki/tls.crt
+      POSTGRES_SSLKEY: /pki/tls.key
+      POSTGRES_SSLROOTCERT: /pki/root_ca.crt
+    volumes:
+      - pki_certs_dbsvc_user:/pki:ro
+
+  dbsvc_user-certs:
+    image: smallstep/step-ca:0.30.2
+    container_name: dbsvc_user-certs
+    profiles: ["pki"]
+    restart: unless-stopped
+    user: "0"
+    entrypoint: ["/bin/sh", "/renewer.sh"]
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - pki_certs_dbsvc_user:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+    networks:
+      - pki-net
+
+volumes:
+  pki_certs_postgres:
+    external: true
+    name: pki_certs_postgres
+  pki_certs_dbsvc_user:
+    external: true
+    name: pki_certs_dbsvc_user
