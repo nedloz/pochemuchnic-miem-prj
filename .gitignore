@@ -1,3 +1,6 @@
 .env
 # Центр сертификации: корневой ключ и сертификаты (scripts/pki/init.sh)
 /pki/
+
+# Ключи подписи контекста пользователя (scripts/gen_user_context_keys.py)
+/secrets/

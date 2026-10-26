@@ -60,6 +60,21 @@ python3 scripts/gen_service_tokens.py --rotate   # перевыпустить в
 Со слабым токеном (заглушка или короче 24 символов) `auth-svc`, `chat-svc`, `graph-rag-svc`
 и `embedding-svc` не стартуют. После ротации нужно пересоздать контейнеры.
 
+### 3.2а. Ключи подписи контекста пользователя
+
+nginx пробрасывает сервисам не голые `X-User-Id` / `X-User-Role`, а подписанный auth-svc токен
+`X-User-Context`; у каждого сервиса-получателя свой ключ проверки. Ключи создаёт скрипт
+(`secrets/user-context/`, в `.gitignore`); без них auth-svc, chat-svc, library-svc и db-svc не
+стартуют:
+
+```bash
+python3 scripts/gen_user_context_keys.py            # создать
+python3 scripts/gen_user_context_keys.py --rotate   # добавить новый ключ, старые принимаются
+```
+
+Описание схемы и ротации — `services/auth-svc/app/user_context.py`, проверка —
+`infra/nginx/tests/user_context_e2e.sh`.
+
 ### 3.3. Что обязательно сменить
 
 | Что | Где | По умолчанию |
@@ -230,5 +245,6 @@ docker compose down                            # остановить (тома 
 - Перед nginx стоит HTTPS (сертификат на reverse proxy или в самом nginx),
   `ADMIN_SESSION_COOKIE_SECURE=true`.
 - Наружу опубликован только nginx (`docker compose config` не показывает других `ports`).
-- `library-svc` не проверяет JWT сам: он доверяет заголовку `X-User-Id`, который ставит nginx
-  после проверки токена. Его порт публиковать нельзя, иначе заголовок можно подделать.
+- `library-svc`, `chat-svc` и `db-svc` не проверяют JWT клиента сами: они принимают подписанный
+  `X-User-Context`, который выписывает auth-svc и пробрасывает nginx. Голые `X-User-Id` и
+  `X-User-Role` не принимаются (`USER_CONTEXT_ALLOW_LEGACY` в рабочей среде не включать).

@@ -260,8 +260,15 @@ services:
       # AUTH_INTERNAL_PORT нигде не определена — compose ругался на пустое значение.
       DATABASE_URL: ${AUTH_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
+      # Подписанный контекст пользователя от nginx вместо голых X-User-Id / X-User-Role
+      # (services/auth-svc/app/user_context.py). Ключи выпускает scripts/gen_user_context_keys.py.
+      USER_CONTEXT_AUDIENCE: auth-svc
+      USER_CONTEXT_KEY_FILE: /run/secrets/user_context_key
+      USER_CONTEXT_MASTER_FILE: /run/secrets/user_context_master
     volumes:
       - ./services/auth-svc:/app
+      - ./secrets/user-context/auth-svc.key:/run/secrets/user_context_key:ro
+      - ./secrets/user-context/master.key:/run/secrets/user_context_master:ro
     networks:
       - app-network
 
@@ -286,8 +293,13 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET}
       MINIO_REGION: ${MINIO_REGION}
       MINIO_SECURE: ${MINIO_SECURE}
+      # Подписанный контекст пользователя от nginx вместо голых X-User-Id / X-User-Role
+      # (services/auth-svc/app/user_context.py). Ключи выпускает scripts/gen_user_context_keys.py.
+      USER_CONTEXT_AUDIENCE: library-svc
+      USER_CONTEXT_KEY_FILE: /run/secrets/user_context_key
     volumes:
       - ./services/library-svc:/app
+      - ./secrets/user-context/library-svc.key:/run/secrets/user_context_key:ro
     networks:
       - library-gateway
       - library-backend
@@ -298,9 +310,9 @@ services:
       dockerfile: Dockerfile
     container_name: chat-svc
     restart: unless-stopped
-    # Порт намеренно не публикуется. chat-svc не проверяет JWT сам — он доверяет заголовку
-    # X-User-Id, который проставляет nginx после auth_request. Прямой доступ к контейнеру
-    # позволил бы подделать этот заголовок и войти в любую чужую сессию.
+    # Порт намеренно не публикуется. chat-svc не проверяет JWT сам: nginx после auth_request
+    # передаёт подписанный auth-svc контекст пользователя (X-User-Context), и подпись проверяется
+    # здесь. Прямой доступ к контейнеру подделать пользователя больше не позволяет.
     env_file:
       - ./services/chat-svc/.env
     environment:
@@ -309,6 +321,12 @@ services:
       POSTGRES_URL: ${CHAT_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
       REDIS_CHANNEL: ws:broadcast
+      # Подписанный контекст пользователя от nginx вместо голых X-User-Id / X-User-Role
+      # (services/auth-svc/app/user_context.py). Ключи выпускает scripts/gen_user_context_keys.py.
+      USER_CONTEXT_AUDIENCE: chat-svc
+      USER_CONTEXT_KEY_FILE: /run/secrets/user_context_key
+    volumes:
+      - ./secrets/user-context/chat-svc.key:/run/secrets/user_context_key:ro
     networks:
       - app-network
 
@@ -401,6 +419,10 @@ services:
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
       POSTGRES_DB: ${POSTGRES_DB}
+      # Подписанный контекст пользователя от nginx вместо голых X-User-Id / X-User-Role
+      # (services/auth-svc/app/user_context.py). Ключи выпускает scripts/gen_user_context_keys.py.
+      USER_CONTEXT_AUDIENCE: db-svc
+      USER_CONTEXT_KEY_FILE: /run/secrets/user_context_key
 
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
@@ -421,6 +443,8 @@ services:
     # ports:
     #   - "127.0.0.1:${DBSVC_PUBLIC_PORT}:8000"
     restart: unless-stopped
+    volumes:
+      - ./secrets/user-context/db-svc.key:/run/secrets/user_context_key:ro
     networks:
       - app-network
 

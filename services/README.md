@@ -40,7 +40,7 @@ Frontend (кнопка видна только роли admin)
    │  nginx: auth_request → /auth/validate-admin (проверка куки в auth-svc)
    │         отказ → 404, к db-svc запрос не уходит
    ▼
-db-svc (принимает X-User-Role: admin от nginx, Bearer-токен в браузер не попадает)
+db-svc (принимает администратора по подписанному X-User-Context от auth-svc, Bearer-токен в браузер не попадает)
 ```
 
 Администратор по умолчанию (`admin@edu.hse.ru` / `admin`) создаётся при первой
