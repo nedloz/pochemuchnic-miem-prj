@@ -226,6 +226,8 @@ services:
     env_file:
       - ./services/embedding-svc/.env
     environment:
+      # Без PKI вызывающего подтвердить нечем; с docker-compose.mtls.yml режим mtls (по умолчанию в коде).
+      INTERNAL_AUTH_MODE: ${INTERNAL_AUTH_MODE:-insecure}
       EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
     volumes:
       - hf_cache:/app/.cache/huggingface
@@ -261,6 +263,8 @@ services:
     env_file:
       - ./services/auth-svc/.env
     environment:
+      # Без PKI вызывающего подтвердить нечем; с docker-compose.mtls.yml режим mtls (по умолчанию в коде).
+      INTERNAL_AUTH_MODE: ${INTERNAL_AUTH_MODE:-insecure}
       # PORT здесь не задаём: порт зашит в CMD Dockerfile'а (8000), а переменная
       # AUTH_INTERNAL_PORT нигде не определена — compose ругался на пустое значение.
       DATABASE_URL: ${AUTH_DATABASE_URL}
@@ -321,6 +325,8 @@ services:
     env_file:
       - ./services/chat-svc/.env
     environment:
+      # Без PKI вызывающего подтвердить нечем; с docker-compose.mtls.yml режим mtls (по умолчанию в коде).
+      INTERNAL_AUTH_MODE: ${INTERNAL_AUTH_MODE:-insecure}
       APP_HOST: 0.0.0.0
       APP_PORT: 8000
       POSTGRES_URL: ${CHAT_DATABASE_URL}
@@ -351,6 +357,8 @@ services:
     env_file:
       - ./services/graph-rag-svc/.env
     environment:
+      # Без PKI вызывающего подтвердить нечем; с docker-compose.mtls.yml режим mtls (по умолчанию в коде).
+      INTERNAL_AUTH_MODE: ${INTERNAL_AUTH_MODE:-insecure}
       DATABASE_URL: ${GRAPH_RAG_DATABASE_URL}
       EMBEDDING_SVC_URL: http://embedding-svc:8000
       EMBEDDING_DIM: ${EMBEDDING_DIM}

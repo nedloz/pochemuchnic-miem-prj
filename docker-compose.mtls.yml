@@ -1,7 +1,7 @@
 # Дополнение к docker-compose.yml: взаимная TLS-аутентификация (mTLS) между шлюзом и сервисами и
 # между самими сервисами. К каждому сервису можно обратиться только с клиентским сертификатом
-# внутреннего CA, а что именно вызывающему можно, решает его CN (infra/mtls/*.conf). Статические
-# токены X-Service-Token остаются вторым слоем.
+# внутреннего CA, а что именно вызывающему можно, решает его CN (infra/mtls/*.conf). Имя вызывающего
+# прокси-сайдкар передаёт приложению в X-Caller-Identity; статических токенов нет.
 #
 #   nginx    ──► auth-svc      /auth/*, /users/me           (но не /internal/*)
 #   nginx    ──► chat-svc      /ws/chat (WebSocket)
@@ -76,6 +76,8 @@ services:
 
   auth-svc:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+    environment:
+      INTERNAL_AUTH_MODE: mtls
 
   auth-svc-mtls:
     <<: *mtls-sidecar
@@ -127,6 +129,7 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
       <<: *mtls-client-env
+      INTERNAL_AUTH_MODE: mtls
       EMBEDDING_SVC_URL: https://embedding-svc:8443
       CHAT_WS_URL: wss://chat-svc:8443/ws/internal/llm
     volumes:
@@ -155,6 +158,8 @@ services:
 
   embedding-svc:
     command: ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"]
+    environment:
+      INTERNAL_AUTH_MODE: mtls
     volumes:
       - mtls_embedding-svc:/pki-svc:ro
 
@@ -185,6 +190,7 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
       <<: *mtls-client-env
+      INTERNAL_AUTH_MODE: mtls
       LLM_STREAM_URL: https://graph-rag-svc:8443/generate
       LLM_CANCEL_URL: https://graph-rag-svc:8443/cancel
       AUTH_PROFILE_URL: https://auth-svc:8443/internal/users/{user_id}/profile
