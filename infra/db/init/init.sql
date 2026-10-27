@@ -24,11 +24,13 @@
 \set seed_admin_email     admin@edu.hse.ru
 \set seed_admin_password  admin
 
--- Размерность векторов модели эмбеддингов (mxbai-embed-large-v1 → 1024).
--- Должна совпадать с EMBEDDING_DIM в корневом .env: ingest-worker и graph-rag-svc
--- сверяют это значение с фактическим типом колонки при запуске и не стартуют при
--- расхождении. Смена модели эмбеддингов требует пересчёта всех чанков и всего графа.
-\set embedding_dim  1024
+-- Размерность векторов модели эмбеддингов (multilingual-e5-base → 768): чанки, быстрые ответы
+-- и ссылки в схеме library. Должна совпадать с EMBEDDING_DIM в корневом .env: ingest-worker и
+-- graph-rag-svc сверяют это значение с фактическим типом колонки при запуске и не стартуют при
+-- расхождении. Смена модели эмбеддингов требует пересчёта всех чанков.
+\set embedding_dim  768
+-- Эмбеддинги имён сущностей графа остались на прежней модели (bge-m3, 1024) и не пересчитываются.
+\set graph_embedding_dim  1024
 
 
 -- =============================================================
@@ -503,6 +505,61 @@ BEGIN
     END IF;
   END IF;
 END $$;
+
+-- Быстрые ответы: готовый ответ на частый вопрос, минуя RAG. Вариант — формулировка вопроса
+-- (основной вопрос и каждый вариант хранятся отдельными строками), по ней идёт векторный поиск.
+-- embedding заполняет ingest-worker; пока он NULL, вариант не участвует в поиске.
+-- Та же схема для существующих баз — migrations/011_notebook_pipeline.sql; держать в синхроне.
+CREATE TABLE IF NOT EXISTS library.quick_answers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    question TEXT NOT NULL UNIQUE,
+    answer TEXT NOT NULL,
+    source TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS library.quick_answer_variants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    quick_answer_id UUID NOT NULL REFERENCES library.quick_answers(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    embedding VECTOR(:embedding_dim),
+    embedding_model TEXT,
+    UNIQUE(quick_answer_id, text)
+);
+
+-- Полезные ссылки (описание → url), подмешиваются в ответ по близости описания к вопросу.
+CREATE TABLE IF NOT EXISTS library.links (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    description TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    embedding VECTOR(:embedding_dim),
+    embedding_model TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Уведомление воркеру: строка без вектора ждёт эмбеддинга. Канал тот же, что у документов
+-- (INGEST_NOTIFY_CHANNEL у ingest-worker); в payload — таблица и id строки.
+CREATE OR REPLACE FUNCTION library.embedding_pending_notify()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify('ingest_jobs', TG_TABLE_NAME || ':' || NEW.id::text);
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_quick_answer_variants_ingest_notify ON library.quick_answer_variants;
+CREATE TRIGGER trg_quick_answer_variants_ingest_notify
+    AFTER INSERT OR UPDATE ON library.quick_answer_variants
+    FOR EACH ROW WHEN (NEW.embedding IS NULL)
+    EXECUTE FUNCTION library.embedding_pending_notify();
+
+DROP TRIGGER IF EXISTS trg_links_ingest_notify ON library.links;
+CREATE TRIGGER trg_links_ingest_notify
+    AFTER INSERT OR UPDATE ON library.links
+    FOR EACH ROW WHEN (NEW.embedding IS NULL)
+    EXECUTE FUNCTION library.embedding_pending_notify();
 CREATE TABLE IF NOT EXISTS library.document_files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES library.documents(id) ON DELETE CASCADE,
@@ -609,7 +666,7 @@ CREATE TABLE IF NOT EXISTS graph.entities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entity_type TEXT NOT NULL,             -- fixed ontology: Студент, Преподаватель, Учебный офис, Приказ, ...
     canonical_name TEXT NOT NULL,
-    name_embedding VECTOR(:embedding_dim), -- same model/dims as library.chunk_embeddings; NULL until backfilled
+    name_embedding VECTOR(:graph_embedding_dim), -- bge-m3 (1024), отдельно от library.chunk_embeddings; NULL until backfilled
     embedding_model TEXT,
     attributes_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
