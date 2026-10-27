@@ -86,6 +86,87 @@ volumes:
 Сервис монтирует тот же том только на чтение. Если стек простоял дольше срока жизни,
 сертификат истёк и обновить его уже нельзя: выполните `enroll.sh` заново.
 
+## Методичка: запуск PKI и выпуск сертификатов
+
+**Что автоматически, а что нет.** Автоматически только *обновление*: пока работает контейнер
+`<сервис>-certs`, сертификат продлевается сам (примерно за треть срока до конца). *Первый*
+сертификат выдаётся вручную `scripts/pki/enroll.sh`, а если контейнер-обновлялка остановился и
+сертификат успел истечь (по умолчанию живёт 24 часа), выпуск нужно повторить: обновить истёкший
+сертификат нельзя. Ни `docker compose up`, ни перезагрузка машины сертификаты не выпускают.
+
+### 1. С нуля (один раз на машину)
+
+```bash
+scripts/pki/init.sh                               # корень, промежуточный сертификат, конфиг CA
+docker compose --profile pki up -d step-ca        # CA; ждём healthy: docker ps | grep step-ca
+```
+
+`init.sh` печатает отпечаток корня; каталог `pki/root/` (ключ корня и пароль) увезите с машины.
+Повторный запуск без `--force` откажется работать; `--force` обнуляет CA и делает недействительными
+все выданные сертификаты.
+
+### 2. Выпуск сертификатов
+
+Имя в команде = идентичность = CN: по нему `infra/mtls/*.conf` решают, что вызывающему можно.
+
+```bash
+# Сервисы за mTLS (docker-compose.mtls.yml). Первые пять нужны для входа пользователя;
+# graph-rag-svc, embedding-svc, ingest-worker, ollama нужны, только если эти сервисы запускаются
+for s in nginx auth-svc chat-svc library-svc db-svc redis minio; do scripts/pki/enroll.sh "$s"; done
+for s in graph-rag-svc embedding-svc ingest-worker; do scripts/pki/enroll.sh "$s"; done   # по необходимости
+
+# Postgres: сервер (999 = пользователь postgres) и клиентские сертификаты, CN = имя роли в БД
+scripts/pki/enroll.sh postgres --uid 999 --gid 999
+for role in auth_user chat_user library_user ingest_user graph_user dbsvc_user; do scripts/pki/enroll.sh "$role"; done
+
+# Наблюдаемость (если включена)
+scripts/pki/enroll.sh prometheus --uid 65534 --gid 65534
+scripts/pki/enroll.sh redis-exporter --uid 59000 --gid 59000
+```
+
+Имена ролей БД берите из `.env` (`AUTH_DB_USER` и т. д.). `enroll.sh` перезаписывает том, поэтому
+его можно запускать повторно. Нужен запущенный `step-ca`.
+
+### 3. Запуск обновляющих контейнеров и сервисов
+
+В `.env` должно быть `COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml`.
+Профиль `pki` включает `*-certs`; **если в `.env` стоит `COMPOSE_PROFILES=llm`, перекройте его**, иначе
+поднимется ollama:
+
+```bash
+export COMPOSE_PROFILES=pki
+docker compose up -d --no-deps \
+    auth-svc auth-svc-mtls auth-svc-certs  library-svc library-svc-mtls library-svc-certs \
+    chat-svc chat-svc-mtls chat-svc-certs  db-svc db-svc-mtls db-svc-certs \
+    minio minio-mtls minio-certs  redis redis-mtls redis-certs
+docker compose up -d --no-deps nginx nginx-certs      # шлюз последним: имена апстримов он разрешает при старте
+```
+
+### 4. Проверка
+
+```bash
+docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'certs|mtls'     # *-certs должны быть Up, не Exited
+for s in nginx auth-svc chat-svc library-svc db-svc redis minio; do
+  echo -n "$s: "; docker run --rm -v pki_certs_$s:/c:ro --entrypoint sh alpine/openssl \
+      -c 'openssl x509 -in /c/tls.crt -noout -enddate'; done                # дата должна быть в будущем
+```
+
+Быстрая проверка пути пользователя: `POST /api/auth/login` через nginx вернёт токен.
+
+### 5. Если что-то сломалось
+
+| Симптом | Причина | Что делать |
+| ------- | ------- | ---------- |
+| nginx отвечает 502, в его логе `upstream SSL certificate verify error: (10:certificate has expired)` | сертификат сервиса или шлюза истёк: `*-certs` был остановлен (перезагрузка Docker, `kill`, выключенная машина) | `enroll.sh <имя>` для истёкших, затем `restart` их `*-mtls`, запустить `*-certs`, `restart nginx` |
+| `Exited (137)` или `Exited (128)` у `*-certs` | контейнер убит | проверить срок сертификата (п. 4); если ещё валиден, достаточно `up -d --force-recreate <сервис>-certs`, иначе выпустить заново |
+| `failed to join PID namespace: No such container` | `*-certs` делит PID-пространство с `*-mtls`/nginx, а те пересозданы | `docker compose up -d --no-deps --force-recreate <сервис>-certs` |
+| после пересоздания сервиса его порт 8443 не отвечает | прокси остался в старом сетевом пространстве | `docker compose up -d` сам перезапускает прокси; при `docker restart` вручную: `docker restart <сервис>-mtls` |
+| `enroll.sh`: «контейнер step-ca не запущен» | CA остановлен | `docker compose --profile pki up -d step-ca` |
+| сервис отвечает 403 | CN не разрешён политикой | правило в `infra/mtls/<получатель>.conf` (кто что может) |
+
+Чтобы стенд, который выключают на выходные, не требовал повторной выдачи в понедельник, поставьте
+`PKI_CERT_TTL=168h` в `.env` (см. «Срок жизни»); сроки уже выданных сертификатов это не меняет.
+
 ## Срок жизни
 
 По умолчанию 24 часа, задаётся `PKI_CERT_TTL` в корневом `.env`:
