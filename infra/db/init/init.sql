@@ -196,6 +196,9 @@ CREATE TABLE IF NOT EXISTS auth.user_profiles (
     year INT CHECK (year IS NULL OR (year >= 1 AND year <= 6)),
     group_name TEXT,
     preferences_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Аватар лежит в MinIO (бакет avatars): avatar_key — ключ объекта, avatar_url — путь API для <img src>.
+    avatar_url TEXT,
+    avatar_key TEXT,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

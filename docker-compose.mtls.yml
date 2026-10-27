@@ -14,6 +14,7 @@
 #   graph-rag-svc, ingest-worker ──► embedding-svc  /embed, /ping
 #   auth-svc, chat-svc ──► redis  (TCP, порт 6380, плюс ACL-пользователь на сервис)
 #   library-svc, ingest-worker (чтение), db-svc (чтение и запись) ──► minio  (порт 8443, права по CN)
+#   auth-svc ──► minio  (только бакет avatars: аватары пользователей)
 #   graph-rag-svc ──► ollama  /api/chat и т. п. (профиль llm; модель грузит ollama-init изнутри)
 #
 # Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
@@ -85,6 +86,8 @@ services:
       <<: *mtls-client-env
       INTERNAL_AUTH_MODE: mtls
       REDIS_URL: rediss://auth-svc:${REDIS_AUTH_PASSWORD:?запустите scripts/gen_redis_acl.py}@redis:6380/0
+      MINIO_ENDPOINT: minio:8443
+      MINIO_SECURE: "true"
     volumes:
       - mtls_auth-svc:/pki-svc:ro
 
@@ -164,9 +167,10 @@ services:
         restart: true
     environment:
       MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_AVATARS_BUCKET: ${MINIO_AVATARS_BUCKET:-avatars}
     volumes:
       - mtls_minio:/pki-svc:ro
-      # шаблон: nginx подставляет ${MINIO_BUCKET} при старте контейнера
+      # шаблон: nginx подставляет ${MINIO_BUCKET} и ${MINIO_AVATARS_BUCKET} при старте контейнера
       - ./infra/mtls/minio.conf:/etc/nginx/templates/default.conf.template:ro
 
   minio-certs:

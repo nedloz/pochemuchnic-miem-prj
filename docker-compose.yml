@@ -185,7 +185,7 @@ services:
     image: chainguard/minio-client:latest
     container_name: minio-init
     entrypoint: ["/usr/bin/mc"]
-    command: ["mb", "--ignore-existing", "local/${MINIO_BUCKET}"]
+    command: ["mb", "--ignore-existing", "local/${MINIO_BUCKET}", "local/${MINIO_AVATARS_BUCKET:-avatars}"]
     environment:
       MC_HOST_local: http://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio:9000
     restart: "no"
@@ -269,6 +269,13 @@ services:
       # AUTH_INTERNAL_PORT нигде не определена — compose ругался на пустое значение.
       DATABASE_URL: ${AUTH_DATABASE_URL}
       REDIS_URL: redis://${REDIS_HOST}:6379/0
+      # Аватары пользователей лежат в отдельном бакете MinIO
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_SECURE: ${MINIO_SECURE}
+      MINIO_REGION: ${MINIO_REGION}
+      MINIO_AVATARS_BUCKET: ${MINIO_AVATARS_BUCKET:-avatars}
       # Подписанный контекст пользователя от nginx вместо голых X-User-Id / X-User-Role
       # (services/auth-svc/app/user_context.py). Ключи выпускает scripts/gen_user_context_keys.py.
       USER_CONTEXT_AUDIENCE: auth-svc
