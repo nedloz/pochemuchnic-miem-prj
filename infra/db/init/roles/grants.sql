@@ -10,7 +10,8 @@
 --   auth-svc     auth.* (чтение/запись), core (чтение)
 --   chat-svc     chat.* (чтение/запись), core (чтение)
 --   library-svc  только чтение: topics, documents, document_files, document_relations; core
---   ingest-worker документы: чтение и статусы очереди; чанки и эмбеддинги: запись; core
+--   ingest-worker документы: чтение и статусы очереди; чанки и эмбеддинги: запись;
+--                быстрые ответы и ссылки: чтение и запись только вектора; core
 --   graph-rag-svc graph.* (чтение/запись), library.* (чтение), rag.* (чтение/вставка),
 --                core (чтение)
 --   db-svc       админка: core и library — запись; graph, chat, rag — чтение (граф правится
@@ -132,6 +133,12 @@ BEGIN
     EXECUTE format('GRANT UPDATE (ingest_status, ingest_attempts, ingest_started_at, indexed_at, '
                    'ingest_error, ingest_next_attempt_at) ON library.documents TO %I', v_ingest);
     EXECUTE format('GRANT SELECT, INSERT, DELETE ON library.chunks, library.chunk_embeddings TO %I', v_ingest);
+
+    -- Быстрые ответы и ссылки: строки добавляет db-svc, воркер лишь досчитывает вектор.
+    -- quick_answers нужна для чтения: признак is_active лежит у родителя варианта. FOR UPDATE
+    -- в выборке требует UPDATE хотя бы на одну колонку, поэтому право выдано на колонки вектора.
+    EXECUTE format('GRANT SELECT ON library.quick_answers, library.quick_answer_variants, library.links TO %I', v_ingest);
+    EXECUTE format('GRANT UPDATE (embedding, embedding_model) ON library.quick_answer_variants, library.links TO %I', v_ingest);
 
     -- graph-rag-svc: пишет свою схему graph и аналитику rag, а библиотеку только читает.
     -- Чтение библиотеки целиком (library_ro), хотя код нашего экземпляра обращается лишь к
