@@ -16,12 +16,14 @@
 #   library-svc, ingest-worker (чтение), db-svc (чтение и запись) ──► minio  (порт 8443, права по CN)
 #   auth-svc ──► minio  (только бакет avatars: аватары пользователей)
 #   graph-rag-svc ──► ollama  /api/chat и т. п. (профиль llm; модель грузит ollama-init изнутри)
+#   graph-rag-svc ──► llm-proxy  POST /v1/chat/completions (порт 8443 самого llm-proxy, без сайдкара)
+#   llm-proxy ──► ollama  /v1/chat/completions (режим ollama в config.json)
 #
 # Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
 #
 # Предварительно выпустить сертификаты (имя = идентичность = CN):
-#   for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker redis minio ollama; do
+#   for s in nginx auth-svc chat-svc library-svc db-svc graph-rag-svc embedding-svc ingest-worker redis minio ollama llm-proxy; do
 #       scripts/pki/enroll.sh "$s"; done
 # Подробности: infra/pki/README.md, раздел «mTLS между сервисами».
 #
@@ -225,6 +227,29 @@ services:
     environment:
       OLLAMA_HOST: http://127.0.0.1:11434
 
+  # --- llm-proxy: сам nginx, поэтому mTLS (порт 8443) и политика по CN — в нём же, без сайдкара ---
+
+  llm-proxy:
+    environment:
+      # обычный HTTP остаётся только для проверки живости изнутри контейнера
+      LLM_PROXY_LISTEN: 127.0.0.1:8080
+    volumes:
+      - mtls_llm-proxy:/pki-svc:ro
+      # сервер на 8443: только CN graph-rag-svc и только POST /v1/chat/completions
+      - ./infra/mtls/llm-proxy.conf:/etc/nginx/conf.d/mtls.conf:ro
+      # клиентский сертификат прокси для режима ollama (ollama.conf пускает CN llm-proxy)
+      - ./infra/llm-proxy/ollama_client_tls.conf:/etc/nginx/llm-proxy-tls/ollama.conf:ro
+
+  llm-proxy-certs:
+    <<: *mtls-renewer
+    pid: "service:llm-proxy"
+    environment:
+      CA_URL: https://step-ca:9000
+      RENEW_EXEC: "kill -HUP 1"
+    volumes:
+      - mtls_llm-proxy:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+
   library-svc:
     command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
     environment:
@@ -404,6 +429,9 @@ volumes:
   mtls_ollama:
     external: true
     name: pki_certs_ollama
+  mtls_llm-proxy:
+    external: true
+    name: pki_certs_llm-proxy
   mtls_minio:
     external: true
     name: pki_certs_minio

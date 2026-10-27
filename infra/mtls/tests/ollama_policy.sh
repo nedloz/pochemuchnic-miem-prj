@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Политика прокси перед Ollama (infra/mtls/ollama.conf) на заглушке: настоящего Ollama не запускаем
 # (он тяжёлый и в профиле llm). Заглушка отвечает 200 на любой путь на 127.0.0.1:11434. Проверяется,
-# что graph-rag-svc ходит только в API чата, управление моделями и чужие сертификаты закрыты.
+# что graph-rag-svc ходит только в API чата, llm-proxy — только в /v1/chat/completions, управление
+# моделями и чужие сертификаты закрыты.
 # Стек не затрагивается (префикс ollamatst). Код возврата — число провалов.
 #
 #   infra/mtls/tests/ollama_policy.sh
@@ -14,7 +15,7 @@ P=ollamatst
 export PKI_DIR="$TMP/pki" PKI_CA_CONTAINER="$P-ca" PKI_CA_VOLUME="${P}_ca_data"
 source "$REPO/scripts/pki/lib.sh"
 NET="$P-net"
-IDS=(ollama graph-rag-svc db-svc)
+IDS=(ollama graph-rag-svc db-svc llm-proxy)
 
 pass=0; fail=0
 expect() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $1: ожидалось '$2', получено '$3'"; fi; }
@@ -55,7 +56,7 @@ sleep 3
 docker exec "$P-ollama-mtls" nginx -t >/dev/null 2>&1 || { echo "ПРОВАЛ  nginx -t"; fail=$((fail + 1)); }
 
 out="$(docker run --rm -i --network "$NET" --entrypoint "" -v "${P}_graph-rag-svc:/c/graph-rag-svc:ro" -v "${P}_db-svc:/c/db-svc:ro" \
-    python:3.12-slim python - 2>&1 <<'PYEND'
+    -v "${P}_llm-proxy:/c/llm-proxy:ro" python:3.12-slim python - 2>&1 <<'PYEND'
 import http.client, socket, ssl
 
 def call(who, method, path):
@@ -76,6 +77,11 @@ r = [
     ("delete", call("graph-rag-svc", "DELETE", "/api/delete")),
     ("обход", call("graph-rag-svc", "POST", "/api/chat/../pull")),
     ("db-svc", call("db-svc", "POST", "/api/chat")),
+    ("grs-v1", call("graph-rag-svc", "POST", "/v1/chat/completions")),
+    ("proxy-v1", call("llm-proxy", "POST", "/v1/chat/completions")),
+    ("proxy-chat", call("llm-proxy", "POST", "/api/chat")),
+    ("proxy-pull", call("llm-proxy", "POST", "/api/pull")),
+    ("proxy-models", call("llm-proxy", "GET", "/v1/models")),
 ]
 print("RESULT", *[f"{k}={v}" for k, v in r])
 nc = call(None, "POST", "/api/chat")
@@ -86,7 +92,7 @@ except OSError:
     print("DIRECT отказ")
 PYEND
 )"
-expect "политика по CN" "RESULT chat=200 generate=200 pull=403 delete=403 обход=403 db-svc=403" "$(grep -o 'RESULT.*' <<<"$out")"
+expect "политика по CN" "RESULT chat=200 generate=200 pull=403 delete=403 обход=403 db-svc=403 grs-v1=403 proxy-v1=200 proxy-chat=403 proxy-pull=403 proxy-models=403" "$(grep -o 'RESULT.*' <<<"$out")"
 expect "без сертификата" "NOCERT отказ" "$(grep -o 'NOCERT.*' <<<"$out")"
 expect "порт 11434 мимо прокси" "DIRECT отказ" "$(grep -o 'DIRECT.*' <<<"$out")"
 

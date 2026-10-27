@@ -1,0 +1,11 @@
+{
+  "mode": "router",
+  "router": {
+    "url": "https://api.polza.ai/v1",
+    "model": "qwen/qwen3.5-9b"
+  },
+  "ollama": {
+    "url": "https://ollama:8443/v1",
+    "model": ""
+  }
+}

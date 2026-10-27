@@ -61,6 +61,36 @@ services:
     networks:
       - app-network
 
+  # Прокси к LLM: graph-rag-svc ходит на http://llm-proxy:8080/v1 с model "default", а куда уйдёт
+  # запрос (внешний роутер или Ollama) и с какой моделью, решает /etc/llm-proxy/config.json на томе
+  # llm_proxy_config. Файл перечитывается на каждом запросе, перезапуск не нужен; на пустом томе
+  # его создаёт entrypoint.sh из config.default.json. Ключ роутера — только здесь, в окружении.
+  # Подробности: infra/llm-proxy/README.md.
+  llm-proxy:
+    image: nginx:1.27-alpine
+    container_name: llm-proxy
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/nginx/llm-proxy/entrypoint.sh"]
+    # entrypoint сбрасывает CMD образа, поэтому команда запуска nginx указана явно.
+    command: ["nginx", "-g", "daemon off;"]
+    environment:
+      ROUTER_KEY: ${ROUTER_KEY:-}
+      # Адрес обычного HTTP-входа; с docker-compose.mtls.yml — 127.0.0.1:8080.
+      LLM_PROXY_LISTEN: "8080"
+    volumes:
+      - ./infra/llm-proxy:/etc/nginx/llm-proxy:ro
+      - ./infra/llm-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - llm_proxy_config:/etc/llm-proxy
+    # Порт наружу не публикуется: прокси нужен только graph-rag-svc внутри app-network.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - app-network
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: postgres
@@ -475,6 +505,9 @@ volumes:
   hf_cache:
   graph_rag_hf_cache:
   ollama_data:
+  # config.json llm-proxy (режим, модели, адреса; ключей нет). Имя — часть контракта: этот же том
+  # подключает db-svc для страницы настроек.
+  llm_proxy_config:
   pip_cache:
   step_ca_data:
 

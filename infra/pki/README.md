@@ -222,7 +222,13 @@ chat-svc ──► graph-rag-svc /generate, /cancel
 db-svc   ──► graph-rag-svc /internal/graph/*
 graph-rag-svc ──► chat-svc /ws/internal/llm (WebSocket)
 graph-rag-svc, ingest-worker ──► embedding-svc   /embed, /ping
+graph-rag-svc ──► llm-proxy   POST /v1/chat/completions   (8443 самого llm-proxy, без сайдкара)
+llm-proxy ──► ollama          /v1/chat/completions        (режим ollama в config.json)
 ```
+
+llm-proxy — сам nginx, поэтому сервер на 8443 с проверкой сертификата и политикой по CN
+(`infra/mtls/llm-proxy.conf`) подключается прямо в его конфигурацию, без отдельного сайдкара;
+подробности — `infra/llm-proxy/README.md`. Выпуск: `scripts/pki/enroll.sh llm-proxy`.
 
 **Как устроено.** Рядом с получателем работает прокси (nginx) **в том же сетевом пространстве**
 (`network_mode: service:...`). Приложение переводится на `127.0.0.1`, поэтому из другого
@@ -278,6 +284,8 @@ docker compose --profile pki up -d --no-deps auth-svc auth-svc-mtls auth-svc-cer
 - `infra/mtls/tests/mtls_e2e.sh` — graph-rag-svc и embedding-svc: политика, отказ без сертификата и
   с самоподписанным «двойником», невозможность обойти прокси, настоящий клиентский код сервисов,
   перечитывание сертификата прокси.
+- `infra/mtls/tests/llm_proxy_policy.sh` — llm-proxy: политика по CN на 8443, закрытый обычный порт,
+  путь в Ollama по mTLS с сертификатом прокси.
 - `infra/mtls/tests/gateway_e2e.sh` — шлюз и пользовательские сервисы: настоящий `nginx.conf` в режиме
   https, прокси перед auth-svc, chat-svc, library-svc, db-svc, политика каждой пары, WebSocket через
   всю цепочку, клиентский код chat-svc и graph-rag-svc, обновление сертификата шлюза.
@@ -293,7 +301,7 @@ Redis, MinIO и Ollama закрыты тем же способом, что и с
 | :-- | :-- | :-- | :-- |
 | Redis | nginx `stream`, порт 6380 (`redis.conf`) | auth-svc, chat-svc, redis-exporter (только статистика) | ACL-пользователь на сервис: auth-svc видит `auth:*`, chat-svc `ws:*` и `chat:*`, без `@admin` и `@dangerous`; пользователь `default` выключен |
 | MinIO | nginx, порт 8443 (`minio.conf`) | library-svc и ingest-worker читают, db-svc читает и пишет | случайные ключи S3 вместо `minioadmin`; консоль только изнутри |
-| Ollama | nginx, порт 8443 (`ollama.conf`) | graph-rag-svc, только `/api/chat` и подобные | управление моделями недоступно; модель тянет `ollama-init` изнутри |
+| Ollama | nginx, порт 8443 (`ollama.conf`) | graph-rag-svc, только `/api/chat` и подобные; llm-proxy, только `/v1/chat/completions` | управление моделями недоступно; модель тянет `ollama-init` изнутри |
 
 Redis 7 не умеет сопоставлять CN сертификата с ACL-пользователем, поэтому доступ двойной:
 сертификат решает, кто вообще может подключиться, пароль ACL-пользователя ограничивает ключи и
