@@ -90,7 +90,7 @@ HTTP-метрики (`http_requests_total`, `http_request_duration_seconds`, `ht
 | chat-svc | `ws_connections_active`, `ws_connections_total`, `messages_total{role}`, `time_to_first_token_seconds`, `answer_duration_seconds{outcome}`, `generation_failures_total{reason}`, `feedback_total{value}`, `redis_cache_requests_total{kind,outcome}` |
 | graph-rag-svc | `generate_requests_total{mode}`, `judge_decisions_total{route}`, `stage_duration_seconds{stage}`, `context_chunks`, `empty_context_total`, `llm_errors_total`, `retrieval_failures_total` |
 | embedding-svc | `embed_requests_total`, `embed_batch_size`, `embed_duration_seconds` |
-| library-svc | `preview_requests_total{mode}`, `preview_cache_requests_total{outcome}`, `preview_cache_evictions_total`, `preview_convert_duration_seconds`, `downloads_total`, `documents{status}` |
+| library-svc | `preview_requests_total{mode}`, `preview_cache_requests_total{outcome}`, `preview_cache_evictions_total`, `preview_convert_duration_seconds`, `downloads_total`, `documents{status}`, `library_tree_refresh_total{result}` |
 | ingest-worker | `ingest_queue_depth{status}`, `ingest_jobs_total{result}`, `ingest_job_duration_seconds{result}`, `ingest_chunks_created_total`, `ingest_job_errors_total{type}` |
 | db-svc | `admin_actions_total{action,result}`, `imports_total{kind,result}`, `corpus_objects{kind}` |
 

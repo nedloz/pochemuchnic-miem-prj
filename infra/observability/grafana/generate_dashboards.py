@@ -244,6 +244,8 @@ def documents() -> Board:
     b.series("Вытеснения из кэша и скачивания в минуту",
              [('sum(rate(pochemuchnik_preview_cache_evictions_total[5m])) * 60', "вытеснения"),
               ('sum(rate(pochemuchnik_downloads_total[5m])) * 60', "скачивания")])
+    b.series("Кэш дерева библиотеки: проверки в минуту",
+             [('sum by (result) (rate(pochemuchnik_library_tree_refresh_total[5m])) * 60', "{{result}}")])
     return b
 
 
