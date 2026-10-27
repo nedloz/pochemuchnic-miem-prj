@@ -3,7 +3,11 @@
 # вместо них заглушка upstream_stub.py под тремя именами (router-a, router-b, ollama-stub). Прокси
 # запускается так же, как в docker-compose.yml (тот же образ, точка входа и монтирования), а
 # config.json пишется из другого контейнера через временный файл и mv — как это будет делать
-# админка db-svc. Стек не затрагивается (префикс llmproxytst). Код возврата — число провалов.
+# админка db-svc. Проверка сертификата роутера — на HTTPS-портах той же заглушки (router-tls,
+# router-untrusted, router-mismatch): тест выпускает одноразовый CA и подкладывает его прокси на место
+# системного набора корневых сертификатов (/etc/ssl/certs/ca-certificates.crt — путь из @router в
+# locations.conf), так что проверяется рабочая настройка, а не ослабленная. Стек не затрагивается
+# (префикс llmproxytst). Код возврата — число провалов.
 #
 #   bash infra/llm-proxy/tests/proxy_e2e.sh
 set -uo pipefail
@@ -29,7 +33,7 @@ field() { grep -m1 "^$1=" <<<"$2" | cut -d= -f2-; }
 
 cleanup() {
     docker rm -f "$STUB" "$PROXY" "$PROXY2" >/dev/null 2>&1
-    docker volume rm -f "$P-config" "$P-config2" >/dev/null 2>&1
+    docker volume rm -f "$P-config" "$P-config2" "$P-tls" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -79,13 +83,32 @@ done
 docker network create "$NET" >/dev/null
 docker volume create "$P-config" >/dev/null
 docker volume create "$P-config2" >/dev/null
+
+# Одноразовый CA и сертификаты HTTPS-заглушек (см. upstream_stub.py). ca-certificates.crt — тестовый
+# CA под именем системного набора: том монтируется прокси в /etc/ssl/certs.
+docker run --rm -v "$P-tls:/tls" --entrypoint "" python:3.12-slim sh -ec '
+    cd /tls
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=llm-proxy test CA" -keyout ca.key -out ca.crt
+    leaf() {
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=$2" -keyout "$1.key" -out "$1.csr"
+        printf "subjectAltName=DNS:%s\n" "$2" > "$1.ext"
+        openssl x509 -req -days 1 -in "$1.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -extfile "$1.ext" -out "$1.crt"
+    }
+    leaf trusted router-tls
+    leaf mismatch other.example
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=router-untrusted" \
+        -addext "subjectAltName=DNS:router-untrusted" -keyout untrusted.key -out untrusted.crt
+    cp ca.crt ca-certificates.crt
+    chmod 644 ./*' >/dev/null 2>&1 || { echo "FAIL  сертификаты для HTTPS-заглушек"; exit 1; }
+
 docker run -d --name "$STUB" --network "$NET" \
     --network-alias router-a --network-alias router-b --network-alias ollama-stub \
-    -v "$HERE:/t:ro" -v "$P-config:/cfg" -v "$P-config2:/cfg2" \
+    --network-alias router-tls --network-alias router-untrusted --network-alias router-mismatch \
+    -v "$HERE:/t:ro" -v "$P-config:/cfg" -v "$P-config2:/cfg2" -v "$P-tls:/tls:ro" \
     python:3.12-slim python -u /t/upstream_stub.py >/dev/null
 
 # --- основной прокси: пустой том, ключ задан ---
-run_proxy "$PROXY" llm-proxy "$P-config" -e ROUTER_KEY="$KEY"
+run_proxy "$PROXY" llm-proxy "$P-config" -e ROUTER_KEY="$KEY" -v "$P-tls:/etc/ssl/certs:ro"
 if ! wait_healthz "$URL"; then
     echo "FAIL  прокси не поднялся"; docker logs "$PROXY" 2>&1 | tail -20; exit 1
 fi
@@ -146,12 +169,49 @@ check "пустая модель активного режима: по посл�
     "$(field status "$out") $(field host "$out") $(field model "$out")"
 
 # --- SSE: события приходят по мере генерации (заглушка шлёт три события с паузой 1 с) ---
+# Поток без длины (до закрытия соединения) nginx с proxy_buffering on держит до конца ответа — эта
+# проверка и ловит включённую буферизацию, в том числе в отдельном location. Chunked-поток (как у
+# роутеров по HTTP/1.1) nginx отдаёт сразу в любом случае, он проверяется как рабочий сценарий.
+sse_check() {  # sse_check ИМЯ ФОРМАТ
+    local out
+    out="$(client stream "$URL/v1/chat/completions" "$2")"
+    check "$1: статус и три события" "200 3" "$(field status "$out") $(field events "$out")"
+    check "$1: первое событие раньше конца ответа (без буферизации)" yes \
+        "$(awk -v f="$(field first "$out")" -v t="$(field total "$out")" 'BEGIN { print (f >= 0 && f < 0.8 && t >= 1.8) ? "yes" : "no" }')"
+}
 write_config /cfg "$CFG_ROUTER_B"
-out="$(client stream "$URL/v1/chat/completions")"
-check "SSE: статус" 200 "$(field status "$out")"
-check "SSE: три события" 3 "$(field events "$out")"
-check "SSE: первое событие раньше конца ответа (без буферизации)" yes \
-    "$(awk -v f="$(field first "$out")" -v t="$(field total "$out")" 'BEGIN { print (f >= 0 && f < 0.8 && t >= 1.8) ? "yes" : "no" }')"
+sse_check "SSE router, поток до закрытия" close
+sse_check "SSE router, chunked" chunked
+write_config /cfg "$CFG_OLLAMA"
+sse_check "SSE ollama, поток до закрытия" close
+
+# --- HTTPS к роутеру: проверка сертификата и SNI (тестовый CA вместо системного набора) ---
+stub_log() { docker logs "$STUB" 2>&1 | grep -F -- "port=$1" | grep -c -F -- "$2"; }
+cfg_router_url() {
+    printf '{"mode": "router", "router": {"url": "%s", "model": "router-model-tls"}, "ollama": {"url": "http://ollama-stub:9000/v1", "model": "ollama-model-1"}}' "$1"
+}
+write_config /cfg "$(cfg_router_url https://router-tls:9443/v1)"
+out="$(client chat "$URL/v1/chat/completions")"
+check "HTTPS, доверенный сертификат: статус" 200 "$(field status "$out")"
+check "HTTPS: SNI и Host по upstream" "router-tls router-tls:9443" "$(field sni "$out") $(field host "$out")"
+check "HTTPS: путь, модель и ключ" "/v1/chat/completions router-model-tls Bearer $KEY" \
+    "$(field path "$out") $(field model "$out") $(field auth "$out")"
+
+write_config /cfg "$(cfg_router_url https://router-untrusted:9444/v1)"
+check "HTTPS, сертификат чужого CA → 502" 502 "$(field status "$(client chat "$URL/v1/chat/completions")")"
+check "чужой CA: прокси соединился, но запрос не отправил" "yes 0" \
+    "$([ "$(stub_log 9444 CONNECT)" -ge 1 ] && echo yes || echo no) $(stub_log 9444 REQUEST)"
+check "чужой CA: ключ до сервера не дошёл" 0 "$(stub_log 9444 "$KEY")"
+check "чужой CA: причина в логе прокси" yes \
+    "$([ "$(log_count "$PROXY" "upstream SSL certificate verify error")" -ge 1 ] && echo yes || echo no)"
+
+write_config /cfg "$(cfg_router_url https://router-mismatch:9445/v1)"
+check "HTTPS, сертификат на другое имя → 502" 502 "$(field status "$(client chat "$URL/v1/chat/completions")")"
+check "чужое имя: прокси соединился, но запрос не отправил" "yes 0" \
+    "$([ "$(stub_log 9445 CONNECT)" -ge 1 ] && echo yes || echo no) $(stub_log 9445 REQUEST)"
+check "чужое имя: ключ до сервера не дошёл" 0 "$(stub_log 9445 "$KEY")"
+check "чужое имя: причина в логе прокси" yes \
+    "$([ "$(log_count "$PROXY" "upstream SSL certificate does not match")" -ge 1 ] && echo yes || echo no)"
 
 # --- запрещённые пути и методы ---
 check "GET /v1/models → 403" 403 "$(field status "$(client status GET "$URL/v1/models")")"

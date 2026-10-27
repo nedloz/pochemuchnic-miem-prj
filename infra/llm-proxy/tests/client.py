@@ -2,8 +2,10 @@
 
     client.py chat URL            тело как у graph-rag-svc (model "default") и чужой Authorization;
                                   печатает, что увидела заглушка upstream
-    client.py stream URL          тот же запрос со "stream": true; печатает число событий SSE,
-                                  время до первого и до конца ответа
+    client.py stream URL [chunked|close]
+                                  тот же запрос со "stream": true; печатает число событий SSE,
+                                  время до первого и до конца ответа. Второй аргумент — как
+                                  заглушка размечает поток (по умолчанию close, см. upstream_stub.py)
     client.py status METHOD URL   только код ответа (тело — пустой JSON-объект или BODY из env)
 """
 
@@ -46,6 +48,7 @@ def chat(url):
     sent = seen["body"]
     print(f"path={seen['path']}")
     print(f"host={seen['host']}")
+    print(f"sni={seen.get('sni', '-')}")
     print(f"model={sent.get('model')}")
     print(f"auth={seen['headers'].get('authorization', '-')}")
     rest_sent = {k: v for k, v in BODY.items() if k != "model"}
@@ -53,8 +56,8 @@ def chat(url):
     print("rest=" + ("same" if rest_sent == rest_seen else "differs:" + json.dumps(rest_seen, ensure_ascii=False)))
 
 
-def stream(url):
-    body = dict(BODY, stream=True)
+def stream(url, framing):
+    body = dict(BODY, stream=True, x_stub_framing=framing)
     t0 = time.monotonic()
     resp = request("POST", url, json.dumps(body, ensure_ascii=False), {"Content-Type": "application/json"})
     print(f"status={resp.status}")
@@ -84,7 +87,7 @@ if __name__ == "__main__":
     if cmd == "chat":
         chat(sys.argv[2])
     elif cmd == "stream":
-        stream(sys.argv[2])
+        stream(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "close")
     elif cmd == "status":
         status(sys.argv[2], sys.argv[3])
     else:
