@@ -14,7 +14,7 @@ ACL-пользователя, который ограничивает коман
     python3 scripts/gen_redis_acl.py --rotate    # перевыпустить пароли
 
 Результат: secrets/redis/users.acl (в .gitignore; в нём только SHA-256 паролей) и переменные
-REDIS_AUTH_PASSWORD, REDIS_CHAT_PASSWORD в .env. После ротации пересоздать redis и сервисы:
+REDIS_AUTH_PASSWORD, REDIS_CHAT_PASSWORD, REDIS_PROMETHEUS_PASSWORD в .env. После ротации пересоздать redis и сервисы:
     docker compose up -d --no-deps redis redis-mtls auth-svc chat-svc
 """
 
@@ -38,6 +38,11 @@ USERS = {
     "auth-svc": ("REDIS_AUTH_PASSWORD", ["auth:*"]),
     "chat-svc": ("REDIS_CHAT_PASSWORD", ["ws:*", "chat:*"]),
 }
+
+# Пользователь redis_exporter (docker-compose.observability.yml): ключей не видит, только
+# служебная статистика.
+EXPORTER_USER = ("prometheus", "REDIS_PROMETHEUS_PASSWORD")
+EXPORTER_RULES = "resetkeys resetchannels -@all +ping +info +config|get +dbsize +slowlog|get +latency|latest +client|list"
 
 
 def read_env() -> dict[str, str]:
@@ -82,6 +87,14 @@ def main() -> int:
         digest = hashlib.sha256(password.encode()).hexdigest()
         keys = " ".join(f"~{p}" for p in patterns)
         lines.append(f"user {service} on #{digest} {keys} resetchannels +@all -@admin -@dangerous")
+
+    name, var = EXPORTER_USER
+    password = env.get(var, "")
+    if args.rotate or len(password) < 32:
+        password = secrets.token_urlsafe(32)
+        set_env(var, password)
+        created.append(name)
+    lines.append(f"user {name} on #{hashlib.sha256(password.encode()).hexdigest()} {EXPORTER_RULES}")
 
     ACL.parent.mkdir(parents=True, exist_ok=True)
     ACL.write_text("\n".join(lines) + "\n", encoding="utf-8")

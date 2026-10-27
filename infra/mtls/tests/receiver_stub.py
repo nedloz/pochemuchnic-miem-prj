@@ -36,6 +36,13 @@ class Handler(BaseHTTPRequestHandler):
                 "embeddings": [[0.0] * DIM for _ in texts], "model": "stub-model", "dimension": DIM,
                 "caller": headers.get("x-caller-identity"),
             })
+        if self.path == "/metrics" and self.command == "GET":
+            text = b"# TYPE stub_up gauge\nstub_up 1\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers()
+            return self.wfile.write(text)
         if self.path in ("/ping", "/health", "/healthz"):
             return self._reply(200, {"status": "ok", "caller": headers.get("x-caller-identity")})
         return self._reply(200, {

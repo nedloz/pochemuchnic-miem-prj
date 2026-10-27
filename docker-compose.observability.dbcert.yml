@@ -1,0 +1,41 @@
+# Вход postgres_exporter в Postgres по клиентскому сертификату вместо пароля.
+# Подключается третьим: -f docker-compose.yml -f docker-compose.pki.yml -f docker-compose.observability.yml
+#                       -f docker-compose.observability.mtls.yml -f docker-compose.observability.dbcert.yml
+#
+# 1. В .env: MONITORING_DB_AUTH=cert, затем `psql -f infra/db/init/roles/sync.sql` (infra/db/README.md):
+#    у роли monitoring_user пропадает пароль, она входит в pki_login.
+# 2. Сертификат с CN, равным имени роли, и владельцем nobody (под ним работает экспортёр):
+#    scripts/pki/enroll.sh monitoring_user --uid 65534 --gid 65534
+# 3. Переменная MONITORING_DB_PASSWORD в этом режиме не нужна (без этого оверлея она обязательна:
+#    пустой пароль в режиме password роль не создаёт, и экспортёр не сможет войти).
+services:
+  postgres:
+    environment:
+      MONITORING_DB_AUTH: cert
+
+  postgres-exporter:
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=verify-full&sslcert=/pki/tls.crt&sslkey=/pki/tls.key&sslrootcert=/pki/root_ca.crt
+    volumes:
+      - mtls_monitoring-db:/pki:ro
+
+  monitoring-db-certs:
+    image: smallstep/step-ca:0.30.2
+    profiles: ["pki"]
+    restart: unless-stopped
+    user: "0"
+    entrypoint: ["/bin/sh", "/renewer.sh"]
+    healthcheck:
+      disable: true
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_monitoring-db:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+    networks:
+      - pki-net
+
+volumes:
+  mtls_monitoring-db:
+    external: true
+    name: pki_certs_${MONITORING_DB_USER:-monitoring_user}

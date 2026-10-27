@@ -153,3 +153,6 @@ FROM (VALUES
     (:'dbsvc_user',   'core, auth, library, chat, graph, public')
 ) AS v(name, path)
 \gexec
+
+-- Роль для postgres_exporter (опциональна, см. monitoring.sql).
+\i /docker-entrypoint-initdb.d/roles/monitoring.sql

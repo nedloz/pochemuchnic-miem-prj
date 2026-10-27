@@ -13,13 +13,13 @@ P=miniotst
 export PKI_DIR="$TMP/pki" PKI_CA_CONTAINER="$P-ca" PKI_CA_VOLUME="${P}_ca_data"
 source "$REPO/scripts/pki/lib.sh"
 NET="$P-net"
-IDS=(minio library-svc db-svc ingest-worker graph-rag-svc)
+IDS=(minio library-svc db-svc ingest-worker graph-rag-svc prometheus)
 IMAGE="$(grep -oE 'chainguard/minio@sha256:[0-9a-f]+' "$REPO/docker-compose.yml" | head -1)"
 BUCKET=documents
 KEY="k$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; SECRET="s$(head -c18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 pass=0; fail=0
-expect() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $1: ожидалось '$2', получено '$3'"; fi; }
+expect() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $1: ожидалось '$2', получено '$3'"; tail -n 6 <<<"${out:-}" | sed 's/^/        /'; fi; }
 
 cleanup() {
     docker rm -f "$PKI_CA_CONTAINER" "$P-minio" "$P-minio-mtls" >/dev/null 2>&1
@@ -47,7 +47,7 @@ done
 
 echo "== MinIO + прокси с боевым шаблоном"
 docker run -d --name "$P-minio" --network "$NET" --network-alias minio --user 0:0 -v "${P}_data:/data" \
-    -e MINIO_ROOT_USER="$KEY" -e MINIO_ROOT_PASSWORD="$SECRET" "$IMAGE" \
+    -e MINIO_ROOT_USER="$KEY" -e MINIO_ROOT_PASSWORD="$SECRET" -e MINIO_PROMETHEUS_AUTH_TYPE=public "$IMAGE" \
     server /data --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 >/dev/null
 docker run -d --name "$P-minio-mtls" --network "container:$P-minio" -e MINIO_BUCKET="$BUCKET" -v "${P}_minio:/pki-svc:ro" \
     -v "$REPO/infra/mtls/minio.conf:/etc/nginx/templates/default.conf.template:ro" nginx:1.27-alpine >/dev/null
@@ -127,7 +127,7 @@ expect "ingest-worker: чтение да, запись нет ($(res "$out"))" "
 
 echo "== политика, чужие сертификаты и обход прокси"
 out="$(docker run --rm -i --network "$NET" --entrypoint "" -v "${P}_graph-rag-svc:/c/graph-rag-svc:ro" -v "${P}_library-svc:/c/library-svc:ro" \
-    -v "${P}_db-svc:/c/db-svc:ro" -e "AK=$KEY" -e "SK=$SECRET" main-db-svc python - 2>&1 <<'PYEND'
+    -v "${P}_db-svc:/c/db-svc:ro" -v "${P}_prometheus:/c/prometheus:ro" -e "AK=$KEY" -e "SK=$SECRET" main-db-svc python - 2>&1 <<'PYEND'
 import http.client, os, socket, ssl
 
 def call(who, method, path):
@@ -149,6 +149,12 @@ r = {
     "library-svc список бакетов": call("library-svc", "GET", "/"),
     "db-svc чужой бакет": call("db-svc", "PUT", "/other/x"),
     "консоль": call("db-svc", "GET", "/minio/health/live"),
+    "prometheus метрики кластера": call("prometheus", "GET", "/minio/v2/metrics/cluster"),
+    "prometheus метрики узла": call("prometheus", "GET", "/minio/v2/metrics/node"),
+    "prometheus читает объект": call("prometheus", "GET", "/documents/dir/file.txt"),
+    "prometheus пишет метрики": call("prometheus", "PUT", "/minio/v2/metrics/cluster"),
+    "prometheus обход пути": call("prometheus", "GET", "/minio/v2/metrics/cluster/../../../documents/dir/file.txt"),
+    "library-svc метрики": call("library-svc", "GET", "/minio/v2/metrics/cluster"),
 }
 print("RESULT", *[f"{k}={v}" for k, v in r.items()])
 nc = call(None, "GET", "/documents/dir/file.txt")
@@ -160,7 +166,7 @@ for port in (9000, 9001):
         print(f"DIRECT {port} отказ")
 PYEND
 )"
-expect "политика по CN" "RESULT graph-rag-svc читает=403 library-svc DELETE=403 library-svc чужой бакет=403 library-svc обход пути=403 library-svc список бакетов=403 db-svc чужой бакет=403 консоль=403" "$(res "$out")"
+expect "политика по CN" "RESULT graph-rag-svc читает=403 library-svc DELETE=403 library-svc чужой бакет=403 library-svc обход пути=403 library-svc список бакетов=403 db-svc чужой бакет=403 консоль=403 prometheus метрики кластера=200 prometheus метрики узла=200 prometheus читает объект=403 prometheus пишет метрики=403 prometheus обход пути=403 library-svc метрики=403" "$(res "$out")"
 nocert="$(grep -o 'NOCERT.*' <<<"$out")"
 [[ "$nocert" != *принято* && -n "$nocert" ]] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "ПРОВАЛ  без клиентского сертификата: $nocert"; }
 expect "порт 9000 мимо прокси" "DIRECT 9000 отказ" "$(grep -o 'DIRECT 9000.*' <<<"$out")"

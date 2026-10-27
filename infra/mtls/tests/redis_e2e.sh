@@ -13,14 +13,14 @@ P=redistst
 export PKI_DIR="$TMP/pki" PKI_CA_CONTAINER="$P-ca" PKI_CA_VOLUME="${P}_ca_data"
 source "$REPO/scripts/pki/lib.sh"
 NET="$P-net"
-IDS=(redis auth-svc chat-svc db-svc)
+IDS=(redis auth-svc chat-svc db-svc redis-exporter)
 
 pass=0; fail=0
 check() { local d=$1; shift; if "$@" >/dev/null 2>&1; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $d"; fi; }
 expect() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "ПРОВАЛ  $1: ожидалось '$2', получено '$3'"; fi; }
 
 cleanup() {
-    docker rm -f "$PKI_CA_CONTAINER" "$P-redis" "$P-redis-mtls" >/dev/null 2>&1
+    docker rm -f "$PKI_CA_CONTAINER" "$P-redis" "$P-redis-mtls" "$P-exporter" >/dev/null 2>&1
     for id in "${IDS[@]}"; do docker volume rm -f "${P}_$id" >/dev/null 2>&1; done
     docker volume rm -f "$PKI_CA_VOLUME" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
@@ -40,7 +40,8 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 for id in "${IDS[@]}"; do
-    "$REPO/scripts/pki/enroll.sh" "$id" --volume "${P}_$id" >/dev/null 2>&1 || { echo "ПРОВАЛ  сертификат $id"; exit 1; }
+    uid=(); [[ "$id" == redis-exporter ]] && uid=(--uid 59000 --gid 59000)
+    "$REPO/scripts/pki/enroll.sh" "$id" --volume "${P}_$id" "${uid[@]}" >/dev/null 2>&1 || { echo "ПРОВАЛ  сертификат $id"; exit 1; }
 done
 REDIS_ACL_FILE="$TMP/users.acl" REDIS_ENV_FILE="$TMP/env" python3 "$REPO/scripts/gen_redis_acl.py" >/dev/null
 chmod a+r "$TMP/users.acl"
@@ -105,6 +106,39 @@ async def main():
     except Exception as e: print("RESULT отказ")
 asyncio.run(main())')"
 expect "сертификат db-svc не пускают" "RESULT отказ" "$(res "$out")"
+
+# redis_exporter с боевыми переменными docker-compose.observability.mtls.yml: ACL-пользователь prometheus
+EXPORTER_IMAGE="$(grep -oE 'oliver006/redis_exporter:[^ ]+' "$REPO/docker-compose.observability.yml" | head -1)"
+exporter_up() { # том сертификата, пароль, [пользователь контейнера] -> метрики экспортёра
+    docker rm -f "$P-exporter" >/dev/null 2>&1
+    docker run -d --name "$P-exporter" --network "$NET" --user "${3:-59000:59000}" -v "$1:/pki-svc:ro" \
+        -e REDIS_ADDR=rediss://redis:6380 -e REDIS_USER=prometheus -e REDIS_PASSWORD="$2" \
+        -e REDIS_EXPORTER_TLS_CLIENT_CERT_FILE=/pki-svc/tls.crt -e REDIS_EXPORTER_TLS_CLIENT_KEY_FILE=/pki-svc/tls.key \
+        -e REDIS_EXPORTER_TLS_CA_CERT_FILE=/pki-svc/root_ca.crt "$EXPORTER_IMAGE" >/dev/null
+    sleep 2
+    docker run --rm --network "container:$P-exporter" --entrypoint "" main-auth-svc python -c \
+        "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:9121/metrics',timeout=10).read().decode())" 2>&1
+}
+metrics="$(exporter_up "${P}_redis-exporter" "$REDIS_PROMETHEUS_PASSWORD")"
+expect "redis-exporter: redis_up 1 по mTLS" "redis_up 1" "$(grep -m1 '^redis_up ' <<<"$metrics")"
+check "redis-exporter: доступны память и ключи" grep -q '^redis_memory_used_bytes' <<<"$metrics"
+expect "redis-exporter: неверный пароль prometheus" "redis_up 0" "$(exporter_up "${P}_redis-exporter" wrong | grep -m1 '^redis_up ')"
+expect "redis-exporter: чужой сертификат (db-svc)" "redis_up 0" "$(exporter_up "${P}_db-svc" "$REDIS_PROMETHEUS_PASSWORD" 0:0 | grep -m1 '^redis_up ')"
+out="$(run_py main-auth-svc "$AUTH_CODE" "${P}_redis-exporter" prometheus "$REDIS_PROMETHEUS_PASSWORD" <<<'
+import asyncio, os
+from redis.exceptions import RedisError
+from app.redis_tls import make_client
+async def attempt(coro):
+    try:
+        await coro; return "ok"
+    except RedisError as e:
+        return "NOPERM" if "permission" in str(e).lower() else str(e)[:30]
+async def main():
+    c = make_client(os.environ["URL"])
+    print("RESULT", await attempt(c.info()), await attempt(c.set("auth:k", "1")), await attempt(c.get("auth:k")),
+          await attempt(c.keys("*")), await attempt(c.flushall()), await attempt(c.config_set("maxmemory", "1")))
+asyncio.run(main())')"
+expect "пользователь prometheus: только чтение статистики ($(res "$out"))" "RESULT ok NOPERM NOPERM NOPERM NOPERM NOPERM" "$(res "$out")"
 
 # без сертификата, по обычному TCP и напрямую в Redis мимо прокси
 out="$(docker run --rm -i --network "$NET" --entrypoint "" -v "${P}_auth-svc:/pki-svc:ro" -e "PW=$REDIS_AUTH_PASSWORD" main-auth-svc python - 2>&1 <<'PYEND'

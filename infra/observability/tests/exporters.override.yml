@@ -1,0 +1,18 @@
+# Только для exporters_e2e.sh: переименовывает контейнеры хранилищ, чтобы проверка не мешала
+# работающему стеку (у основных контейнеров фиксированные container_name), и подменяет шлюз
+# заглушкой со stub_status (настоящий образ nginx собирает фронтенд).
+services:
+  postgres:
+    container_name: obs-test-postgres
+  redis:
+    container_name: obs-test-redis
+  minio:
+    container_name: obs-test-minio
+  nginx:
+    container_name: obs-test-nginx
+    build: !reset null
+    image: nginx:1.27-alpine
+    ports: !reset []
+    environment: !override {}
+    volumes: !override
+      - ./infra/observability/tests/stub_nginx.conf:/etc/nginx/nginx.conf:ro

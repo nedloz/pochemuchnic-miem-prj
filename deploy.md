@@ -177,6 +177,16 @@ scripts/pki/enroll.sh <имя-сервиса>
 ограничения и проверки — в `infra/pki/README.md`, раздел «mTLS между шлюзом и сервисами и между
 сервисами».
 
+### Метрики, логи и дашборды (необязательно)
+
+Отдельный оверлей поднимает Prometheus, Loki, Grafana и экспортёры (`docker-compose.observability.yml`,
+профиль `observability`). В `.env` нужны `GRAFANA_ADMIN_PASSWORD` и `MONITORING_DB_PASSWORD`;
+Grafana слушает только `127.0.0.1:3000`, пользователь `admin`. Роль мониторинга в Postgres создаётся
+при инициализации базы либо через `roles/sync.sql`. За mTLS Prometheus нужен собственный сертификат:
+`scripts/pki/enroll.sh prometheus --uid 65534 --gid 65534`; redis_exporter - `enroll.sh redis-exporter --uid 59000 --gid 59000`.
+Вход postgres_exporter по сертификату вместо пароля - оверлей `docker-compose.observability.dbcert.yml`. Подробности и список метрик -
+`infra/observability/README.md`.
+
 ## 5. Первичное наполнение
 
 1. Откройте `http://<хост>:<NGINX_PORT>`, войдите администратором `admin@edu.hse.ru` / `admin`

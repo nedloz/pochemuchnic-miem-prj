@@ -1,0 +1,78 @@
+# Дополнение к docker-compose.observability.yml для стека за mTLS: Prometheus получает
+# сертификат с CN=prometheus и ходит в сервисы на :8443 (политика — infra/mtls/*.conf).
+# Подключение (после observability и mtls):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml:docker-compose.observability.yml:docker-compose.observability.mtls.yml
+# Предварительно:
+#   scripts/pki/enroll.sh prometheus --uid 65534 --gid 65534    # владелец файлов: пользователь образа prometheus
+#
+# Конфигурация Prometheus подменяется здесь же (тот же путь в контейнере), PROMETHEUS_CONFIG не нужен.
+
+services:
+  prometheus:
+    volumes:
+      - ./infra/observability/prometheus/prometheus.mtls.yml:/etc/prometheus/prometheus.yml:ro
+      - mtls_prometheus:/pki-svc:ro
+
+  # Обновляет сертификат Prometheus. Перезапуск не нужен: Prometheus перечитывает клиентский
+  # сертификат из файлов при каждом новом соединении.
+  prometheus-certs:
+    image: smallstep/step-ca:0.30.2
+    profiles: ["pki"]
+    restart: unless-stopped
+    user: "0"
+    entrypoint: ["/bin/sh", "/renewer.sh"]
+    healthcheck:
+      disable: true
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_prometheus:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+    networks:
+      - pki-net
+
+  # redis_exporter ходит в Redis за прокси: TLS с собственным сертификатом (CN=redis-exporter) и
+  # ACL-пользователем prometheus (пароль REDIS_PROMETHEUS_PASSWORD выпускает scripts/gen_redis_acl.py).
+  # Предварительно: scripts/pki/enroll.sh redis-exporter --uid 59000 --gid 59000
+  redis-exporter:
+    user: "59000:59000"
+    environment:
+      REDIS_ADDR: rediss://redis:6380
+      REDIS_USER: prometheus
+      REDIS_PASSWORD: ${REDIS_PROMETHEUS_PASSWORD:?запустите scripts/gen_redis_acl.py}
+      REDIS_EXPORTER_TLS_CLIENT_CERT_FILE: /pki-svc/tls.crt
+      REDIS_EXPORTER_TLS_CLIENT_KEY_FILE: /pki-svc/tls.key
+      REDIS_EXPORTER_TLS_CA_CERT_FILE: /pki-svc/root_ca.crt
+    volumes:
+      - mtls_redis-exporter:/pki-svc:ro
+
+  redis-exporter-certs:
+    image: smallstep/step-ca:0.30.2
+    profiles: ["pki"]
+    restart: unless-stopped
+    user: "0"
+    entrypoint: ["/bin/sh", "/renewer.sh"]
+    healthcheck:
+      disable: true
+    environment:
+      CA_URL: https://step-ca:9000
+    volumes:
+      - mtls_redis-exporter:/certs
+      - ./infra/pki/renewer.sh:/renewer.sh:ro
+    networks:
+      - pki-net
+
+  # С docker-compose.pki.yml Postgres принимает только TLS. Роль мониторинга входит по паролю
+  # (группа pw_login) через зашифрованное соединение; вход по сертификату (MONITORING_DB_AUTH=cert)
+  # потребует отдельного клиентского сертификата и здесь пока не настроен.
+  postgres-exporter:
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=require
+
+volumes:
+  mtls_redis-exporter:
+    external: true
+    name: pki_certs_redis-exporter
+  mtls_prometheus:
+    external: true
+    name: pki_certs_prometheus

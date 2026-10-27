@@ -210,7 +210,7 @@ Redis, MinIO и Ollama закрыты тем же способом, что и с
 
 | Хранилище | Прокси | Кто пускается | Дополнительно |
 | :-- | :-- | :-- | :-- |
-| Redis | nginx `stream`, порт 6380 (`redis.conf`) | auth-svc, chat-svc | ACL-пользователь на сервис: auth-svc видит `auth:*`, chat-svc `ws:*` и `chat:*`, без `@admin` и `@dangerous`; пользователь `default` выключен |
+| Redis | nginx `stream`, порт 6380 (`redis.conf`) | auth-svc, chat-svc, redis-exporter (только статистика) | ACL-пользователь на сервис: auth-svc видит `auth:*`, chat-svc `ws:*` и `chat:*`, без `@admin` и `@dangerous`; пользователь `default` выключен |
 | MinIO | nginx, порт 8443 (`minio.conf`) | library-svc и ingest-worker читают, db-svc читает и пишет | случайные ключи S3 вместо `minioadmin`; консоль только изнутри |
 | Ollama | nginx, порт 8443 (`ollama.conf`) | graph-rag-svc, только `/api/chat` и подобные | управление моделями недоступно; модель тянет `ollama-init` изнутри |
 
@@ -225,6 +225,16 @@ Redis 7 не умеет сопоставлять CN сертификата с AC
 
 Тесты на одноразовых контейнерах: `infra/mtls/tests/redis_e2e.sh`, `minio_e2e.sh`,
 `ollama_policy.sh` (Ollama проверяется на заглушке, настоящий не запускается).
+
+## Наблюдаемость за mTLS
+
+Prometheus собирает `/metrics` сервисов на `:8443` со своим сертификатом (CN `prometheus`), прокси
+пускают его только на `GET /metrics` (и MinIO только на `/minio/v2/metrics/cluster`). redis_exporter
+ходит в Redis с сертификатом CN `redis-exporter` и ACL-пользователем `prometheus`. Выпуск:
+`scripts/pki/enroll.sh prometheus --uid 65534 --gid 65534` и
+`scripts/pki/enroll.sh redis-exporter --uid 59000 --gid 59000`; обновление сертификатов делают
+`prometheus-certs` и `redis-exporter-certs` из `docker-compose.observability.mtls.yml`. Проверка
+политики: `infra/observability/tests/metrics_policy.sh`. Подробности - `infra/observability/README.md`.
 
 ## Переезд в Kubernetes
 

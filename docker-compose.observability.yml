@@ -1,0 +1,173 @@
+# Дополнение к docker-compose.yml: метрики (Prometheus), логи (Loki + Alloy) и дашборды (Grafana).
+# Подключение:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml --profile observability up -d
+# или постоянно, в корневом .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.observability.yml
+#   COMPOSE_PROFILES=observability   (через запятую с остальными профилями)
+#
+# За mTLS (docker-compose.mtls.yml) Prometheus ходит в сервисы с собственным сертификатом:
+#   scripts/pki/enroll.sh prometheus
+#   PROMETHEUS_CONFIG=prometheus.mtls.yml
+# Подробности: infra/observability/README.md.
+#
+# Без этого файла стек работает как раньше.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: prometheus
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      # Простой режим и mTLS отличаются только адресами и сертификатом целей.
+      - ./infra/observability/prometheus/${PROMETHEUS_CONFIG:-prometheus.yml}:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - app-network
+
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: loki
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./infra/observability/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - app-network
+
+  # Читает логи всех контейнеров через Docker и отправляет в Loki. Сокет Docker монтируется
+  # только на чтение; метка service берётся из имени compose-сервиса.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    container_name: alloy
+    profiles: ["observability"]
+    restart: unless-stopped
+    user: "0"
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+    volumes:
+      - ./infra/observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    profiles: ["observability"]
+    restart: unless-stopped
+    # Наружу только на локальный адрес машины.
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?задайте GRAFANA_ADMIN_PASSWORD в .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./infra/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - app-network
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    profiles: ["observability"]
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - app-network
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - app-network
+
+  # --- метрики хранилищ ---
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: redis-exporter
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    networks:
+      - app-network
+
+  # Входит ролью мониторинга (infra/db/init/roles/monitoring.sql, членство в pg_monitor): данных
+  # приложения она не видит. Роль создаётся при инициализации базы или через sync.sql.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: postgres-exporter
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=${MONITORING_DB_SSLMODE:-disable}
+      DATA_SOURCE_USER: ${MONITORING_DB_USER:-monitoring_user}
+      DATA_SOURCE_PASS: ${MONITORING_DB_PASSWORD:-}
+    networks:
+      - app-network
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.0
+    container_name: nginx-exporter
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/stub_status
+    networks:
+      - app-network
+
+  # Эти сервисы определены в docker-compose.yml: здесь только то, что нужно наблюдаемости.
+  postgres:
+    environment:
+      MONITORING_DB_USER: ${MONITORING_DB_USER:-monitoring_user}
+      MONITORING_DB_PASSWORD: ${MONITORING_DB_PASSWORD:-}
+
+  # Метрики кластера без токена: за mTLS их отдаёт прокси только пользователю prometheus
+  # (infra/mtls/minio.conf), в простом режиме порт доступен лишь внутри app-network.
+  minio:
+    environment:
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+
+volumes:
+  prometheus_data:
+  loki_data:
+  alloy_data:
+  grafana_data:
