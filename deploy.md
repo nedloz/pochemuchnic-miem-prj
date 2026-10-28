@@ -177,6 +177,9 @@ docker compose up -d
 пайплайн ноутбука. Векторы разных моделей несравнимы, поэтому старые удаляются и всё
 пересчитывается заново; пока переиндексация идёт, поиск находит меньше (но не чужие векторы).
 
+**Чат недоступен всё время миграции:** `graph-rag-svc` остаётся остановленным до шага 9, где он
+запускается снова, поэтому вопросы студентов эти часы не обрабатываются. Выберите окно заранее.
+
 **Порядок важен.** Миграция 011 возвращает документы в `pending` и переводит колонку на
 `VECTOR(768)`. Если в этот момент работает старый `ingest-worker` (`EMBEDDING_DIM=1024`, старый
 `embedding-svc` на bge-m3), он заберёт документы, получит векторы 1024 и не сможет их вставить —
@@ -246,7 +249,7 @@ docker compose up -d
    ```bash
    SQL="COPY (SELECT 'Название документа: ' || d.title || chr(10) || 'Категория: ' || d.category || chr(10) || 'Раздел: ' || coalesce(c.section_path, '') || chr(10) || 'Текст: ' || c.text FROM library.chunks c JOIN library.documents d ON d.id = c.document_id) TO STDOUT WITH (FORMAT csv)"
    echo "$SQL" | docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -f -' \
-     | docker compose exec -T embedding-svc python -c '
+     | docker compose exec -T embedding-svc python -c 'import sys, textwrap; exec(textwrap.dedent(sys.argv[1]))' '
    import csv, sys
    from transformers import AutoTokenizer
    tok = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-base")
@@ -255,6 +258,9 @@ docker compose up -d
    print(f"чанков: {len(lens)}, длиннее 512 токенов: {over} ({over / max(len(lens), 1):.1%}), максимум: {max(lens, default=0)}")
    '
    ```
+
+   (Код Python обёрнут в `textwrap.dedent`, поэтому команду можно вставлять прямо из файла вместе
+   с отступом списка.)
 
    Если доля заметная, решение за владельцем: уменьшить `max_chars` в
    `services/ingest-worker/app/notebook_chunker.py` (1600 / 1400; это расхождение с ноутбуком) и
@@ -274,6 +280,8 @@ docker compose up -d
     `ingest-worker` (`SELECT count(*) FROM library.quick_answer_variants WHERE embedding IS NULL`).
 11. Проверить вопрос через чат или `POST /generate` в режиме `sync`. Новые чанки
     `graph-rag-svc` подхватывает сам, раз в 60 с.
+12. После миграции запустить `infra/db/tests/check_roles.sh` (имя контейнера — по умолчанию
+    `postgres`): ожидается, что все проверки пройдены («0 провалено»).
 
 `graph.entities.name_embedding` остаётся `VECTOR(1024)`: GraphRAG отключён и граф не читается.
 
