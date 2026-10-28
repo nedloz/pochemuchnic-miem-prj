@@ -57,7 +57,7 @@ res() { grep -o 'RESULT.*' <<<"$1" | head -1; }
 echo "== ingest-worker: документы без файла"
 worker() {
     py main-ingest-worker "$REPO/services/ingest-worker/app:/app/app:ro" -w /app/app \
-        -e DATABASE_URL="postgresql+asyncpg://ingest_user:$PW@postgres:5432/app_db" -e EMBEDDING_SVC_URL=http://x:1 -e EMBEDDING_DIM=1024 \
+        -e DATABASE_URL="postgresql+asyncpg://ingest_user:$PW@postgres:5432/app_db" -e EMBEDDING_SVC_URL=http://x:1 -e EMBEDDING_DIM=768 \
         -e INGEST_NO_FILE_GRACE_SEC="${1:-300}" <<'PYEND'
 import asyncio, main as w
 print("RESULT", asyncio.run(w.flag_documents_without_file()))
