@@ -11,15 +11,15 @@
 | Что | Зачем |
 | :-- | :-- |
 | Docker Engine + Compose v2 (**системный движок, не Docker Desktop**) | Docker Desktop на Linux держит свою VM, в которую GPU не пробрасывается (`failed to discover GPU vendor from CDI`) |
-| NVIDIA GPU + драйвер + `nvidia-container-toolkit` | `embedding-svc` резервирует GPU (модель `BAAI/bge-m3`), `ollama` тоже |
+| NVIDIA GPU + драйвер + `nvidia-container-toolkit` | `embedding-svc` резервирует GPU (модель `intfloat/multilingual-e5-base`), `ollama` (резерв, профиль `llm`) тоже |
 | Git ≥ 2.13 | В проекте сабмодули |
-| ~15 ГБ свободного диска | Образы, веса `bge-m3` (~2.3 ГБ), модель ollama, тома postgres/minio |
-| Доступ в интернет при первом запуске | Скачивание весов с Hugging Face и модели ollama |
+| ~15 ГБ свободного диска | Образы, веса e5 (~1.1 ГБ), модель ollama (если включён профиль `llm`), тома postgres/minio |
+| Доступ в интернет | Скачивание весов с Hugging Face при первом запуске; вызовы внешнего LLM-роутера из `llm-proxy` |
 | Почтовый ящик сервиса | Письма подтверждения и сброса пароля, см. раздел 6 |
 
 pnpm и Node на хосте не нужны: фронтенд собирается внутри образа `nginx` (`infra/nginx/Dockerfile`).
 
-Без GPU стек не запустится в таком виде: уберите `llm` из `COMPOSE_PROFILES` в `.env`, а для
+Без GPU стек не запустится в таком виде: не включайте профиль `llm` (`COMPOSE_PROFILES`), а для
 `embedding-svc` уберите блок `deploy.resources` в `docker-compose.yml` (модель пойдёт на CPU,
 но медленно).
 
@@ -103,12 +103,23 @@ python3 scripts/gen_user_context_keys.py --rotate   # добавить новы�
 
 ### 3.4. Профили и модели
 
-- `COMPOSE_PROFILES=llm` поднимает `ollama` и `ollama-init`, который скачивает модель
-  `OLLAMA_MODEL` (по умолчанию `mistral`).
-- `EMBEDDER_MODEL_NAME` и `EMBEDDING_DIM` связаны: для `BAAI/bge-m3` размерность 1024, она же
-  объявлена в схеме БД. Смена модели = пересчёт всех чанков и графа
-  (`services/graph-rag-svc/README.md`, §13.1).
-- Настройки LLM и графа — `services/graph-rag-svc/.env`.
+- **LLM** — только через `llm-proxy` (`infra/llm-proxy/README.md`). Ключ роутера — `ROUTER_KEY`
+  в `main/.env` (попадает только в окружение прокси). Режим (`router` / `ollama`), модель и адрес
+  роутера — в `/etc/llm-proxy/config.json` на томе `llm_proxy_config`; при первом старте он
+  создаётся из `infra/llm-proxy/config.default.json`, правки действуют со следующего запроса:
+
+  ```bash
+  docker compose exec llm-proxy cat /etc/llm-proxy/config.json
+  docker compose exec -T llm-proxy sh -c 'cat > /etc/llm-proxy/config.json.tmp && mv /etc/llm-proxy/config.json.tmp /etc/llm-proxy/config.json' < my-config.json
+  ```
+- `COMPOSE_PROFILES=llm` поднимает резервную `ollama` и `ollama-init`, который скачивает модель
+  `OLLAMA_MODEL` (по умолчанию `mistral`); она должна совпадать с `ollama.model` в `config.json`.
+  По умолчанию профиль выключен.
+- `EMBEDDER_MODEL_NAME` и `EMBEDDING_DIM` связаны: для `intfloat/multilingual-e5-base`
+  размерность 768, она же объявлена в схеме БД. Смена модели = пересчёт всех векторов
+  (см. «Миграция на e5» ниже).
+- Настройки `graph-rag-svc` (таймауты, очередь, пределы входа) — `services/graph-rag-svc/.env`;
+  адрес прокси (`LLM_BASE_URL`) задаёт compose.
 
 ## 4. Запуск
 
@@ -120,8 +131,9 @@ docker compose logs -f embedding-svc
 ```
 
 Первый запуск долгий: `embedding-svc` скачивает веса (до 15 минут, `start_period` healthcheck'а
-900 с), `ollama-init` тянет модель. `graph-rag-svc` и `ingest-worker` стартуют только после
-того, как `embedding-svc` стал healthy.
+900 с), с профилем `llm` ещё и `ollama-init` тянет модель. `graph-rag-svc` и `ingest-worker`
+стартуют только после того, как `embedding-svc` стал healthy; `graph-rag-svc` ещё ждёт
+healthy `llm-proxy`.
 
 Снаружи опубликован один порт — `nginx` (`NGINX_PORT`, по умолчанию 80). postgres, redis,
 minio и все сервисы доступны только внутри сети compose; для `psql`:
@@ -156,6 +168,52 @@ docker compose up -d
 ```
 
 Проверить результат: `infra/db/tests/check_roles.sh`. Подробности — `infra/db/README.md`.
+
+Миграции 009–010 применяются так же; 011–012 — в составе перехода на e5 (следующий раздел).
+
+### Миграция на e5 (пайплайн ноутбука)
+
+Переход работающего стенда с `BAAI/bge-m3` (1024) на `intfloat/multilingual-e5-base` (768) и на
+пайплайн ноутбука. Векторы разных моделей несравнимы, поэтому старые удаляются и всё
+пересчитывается заново; пока переиндексация идёт, поиск находит меньше (но не чужие векторы).
+
+1. В `main/.env` (не в git) выставить:
+   `EMBEDDING_DIM=768`, `EMBEDDER_MODEL_NAME=intfloat/multilingual-e5-base`, `ROUTER_KEY=<ключ
+   роутера>`; убрать `GRAPH_RAG_WITH_LOCAL_LLM` и, если Ollama не нужна, `llm` из
+   `COMPOSE_PROFILES`. С прежним `EMBEDDING_DIM=1024` `graph-rag-svc` и `ingest-worker` не
+   стартуют.
+2. В `services/graph-rag-svc/.env` убрать устаревшие `LLM_PROVIDER`, `OPENAI_*`, `OLLAMA_*`,
+   `TRANSFORMERS_MODEL`, `DEVICE`, `JUDGE_MODE` и поставить `EMBEDDING_DIM=768` (образец —
+   `.env.example` сервиса). Compose всё равно передаёт `EMBEDDING_DIM` и `LLM_BASE_URL` поверх
+   этого файла, но лишние переменные вводят в заблуждение.
+3. Применить миграции (011 очищает `library.chunk_embeddings`, переводит колонку на `VECTOR(768)`,
+   создаёт таблицы быстрых ответов и ссылок и возвращает проиндексированные документы в
+   `pending`; 012 — права `ingest_user` на новые таблицы):
+
+   ```bash
+   for m in 011_notebook_pipeline 012_notebook_grants; do
+     docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f -' \
+       < infra/db/migrations/$m.sql
+   done
+   ```
+4. Пересоздать сервисы с новыми переменными: `docker compose up -d --build embedding-svc llm-proxy
+   ingest-worker graph-rag-svc db-svc`. `embedding-svc` скачает e5 и ответит `"dimension": 768`
+   на `/ping`.
+5. Дождаться, пока `ingest-worker` переиндексирует все документы:
+
+   ```sql
+   SELECT ingest_status, count(*) FROM library.documents GROUP BY 1;  -- ждать, пока не останется pending/processing
+   SELECT embedding_model, count(*) FROM library.chunk_embeddings GROUP BY 1;
+   ```
+6. Настроить `config.json` прокси (раздел 3.4): модель и адрес роутера.
+7. Загрузить быстрые ответы и ссылки через админку (`/admin/`, или напрямую с токеном):
+   `POST /api/db/library/quick-answers/import` (файл `HSE_Answers_RU.xlsx`) и
+   `POST /api/db/library/links/import` (`all_links.txt`), поле `file`. Векторы досчитает
+   `ingest-worker` (`SELECT count(*) FROM library.quick_answer_variants WHERE embedding IS NULL`).
+8. Проверить вопрос через чат или `POST /generate` в режиме `sync`. `graph-rag-svc` подхватывает
+   новые чанки сам, раз в 60 с.
+
+`graph.entities.name_embedding` остаётся `VECTOR(1024)`: GraphRAG отключён и граф не читается.
 
 ### Внутренний центр сертификации (необязательно)
 
@@ -198,13 +256,11 @@ Grafana слушает только `127.0.0.1:3000`, пользователь `
 2. Загрузите документы через админ-панель (`/admin/`) или подключите краулер.
    `ingest-worker` подхватывает новые документы сам (LISTEN/NOTIFY), режет на чанки и считает
    эмбеддинги.
-3. Постройте граф (оффлайн-команда, один раз и после крупных изменений данных):
-
-   ```bash
-   docker compose run --rm graph-rag-svc python -m cli.build_graph --full-rebuild
-   ```
-
+3. Загрузите быстрые ответы (Excel) и полезные ссылки (`all_links.txt`) — шаг 7 раздела
+   «Миграция на e5». Граф строить не нужно: GraphRAG отключён.
 4. Проверьте сквозной сценарий скриптами из `tests/` (`test_flow.py`, `test_library.py`).
+   `tests/test_notebook_pipeline_flow.py` проверяет путь вопроса без стека, на одноразовых
+   контейнерах (нужен только docker).
 
 ## 6. Почта сервиса для писем и уведомлений
 

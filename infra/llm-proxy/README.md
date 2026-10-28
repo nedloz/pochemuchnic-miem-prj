@@ -72,7 +72,7 @@ nginx, логи и ответы он не попадает: шаблон отр�
 | Запрос | Ответ |
 | :-- | :-- |
 | `POST /v1/chat/completions` | тело уходит на `<url>/chat/completions` активного режима с `model` режима; ответ, в том числе SSE (`"stream": true`), идёт потоком |
-| `GET /healthz` | 200 (на обычном HTTP-входе) |
+| `GET /healthz` | 200 на обычном HTTP-входе; на mTLS-входе 8443 — 403 (политика по CN пускает только `POST /v1/chat/completions`), живость проверяется изнутри контейнера по `127.0.0.1:8080` |
 | всё остальное (`/v1/models`, `/v1/embeddings`, другие методы) | 403 |
 
 Свои ответы прокси: 400 — тело не JSON-объект; 503 — нет корректной конфигурации или нет ключа
@@ -114,8 +114,10 @@ nginx, логи и ответы он не попадает: шаблон отр�
 `infra/pki/README.md`). Поэтому сервер на 8443 с `ssl_verify_client on` и политикой по CN
 подключается прямо в его конфигурацию, а маршруты у обоих входов общие (`locations.conf`).
 
-Адрес `https://llm-proxy:8443/v1` для `graph-rag-svc` в режиме mTLS задаётся при подключении
-сервиса к прокси (вместе с клиентом `llm-proxy` в `graph-rag-svc`).
+`graph-rag-svc` ходит на `http://llm-proxy:8080/v1` в базовом стеке и на `https://llm-proxy:8443/v1`
+с mTLS-оверлеем (`LLM_BASE_URL` в `docker-compose.yml` / `docker-compose.mtls.yml`) и стартует только
+после healthy `llm-proxy`. Сквозная проверка `graph-rag-svc` через настоящий прокси —
+`tests/test_notebook_pipeline_flow.py` в корне `main`.
 
 ## Логи
 
