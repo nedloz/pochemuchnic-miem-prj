@@ -484,6 +484,9 @@ services:
 
       DBSVC_ADMIN_TOKEN: ${DBSVC_ADMIN_TOKEN}
       GRAPH_RAG_URL: http://graph-rag-svc:8000
+      # Для страницы «Настройки проекта» (только чтение).
+      EMBEDDER_MODEL_NAME: ${EMBEDDER_MODEL_NAME}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
     # Без ожидания готовности базы сервис успевал стартовать раньше postgres, получал
     # "Connection refused" и продолжал работу без таблицы журнала задач: импорт падал
     # пятисоткой уже в интерфейсе, а причина оставалась в первых строках лога.
@@ -496,6 +499,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./secrets/user-context/db-svc.key:/run/secrets/user_context_key:ro
+      # config.json llm-proxy: страница настроек показывает действующие режим и модель LLM.
+      - llm_proxy_config:/etc/llm-proxy:ro
     networks:
       - app-network
 
