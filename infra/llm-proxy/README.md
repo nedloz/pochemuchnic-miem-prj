@@ -117,7 +117,8 @@ nginx, логи и ответы он не попадает: шаблон отр�
 `graph-rag-svc` ходит на `http://llm-proxy:8080/v1` в базовом стеке и на `https://llm-proxy:8443/v1`
 с mTLS-оверлеем (`LLM_BASE_URL` в `docker-compose.yml` / `docker-compose.mtls.yml`) и стартует только
 после healthy `llm-proxy`. Сквозная проверка `graph-rag-svc` через настоящий прокси —
-`tests/test_notebook_pipeline_flow.py` в корне `main`.
+`tests/test_notebook_pipeline_flow.py` в корне `main`, только по HTTP (порт 8080); mTLS-путь (8443)
+проверяется `llm_proxy_policy.sh` и не покрыт сквозным тестом с настоящим образом `graph-rag-svc`.
 
 ## Логи
 

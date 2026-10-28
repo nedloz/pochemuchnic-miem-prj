@@ -18,6 +18,10 @@
   (d) вопрос не по теме проходит через промпт с guardrails;
   (f) вопрос в 20000 символов принимается и доходит до LLM обрезанным до 4000;
   (e) upstream LLM недоступен — /generate отвечает 502 за секунды, а не висит.
+Проверяется только путь по обычному HTTP: graph-rag-svc ходит на http://llm-proxy:8080/v1 с
+INTERNAL_AUTH_MODE=insecure. mTLS-путь (https://llm-proxy:8443 с клиентским сертификатом
+graph-rag-svc, docker-compose.mtls.yml) здесь не покрыт: политику прокси на 8443 проверяет
+infra/mtls/tests/llm_proxy_policy.sh, но без настоящего образа graph-rag-svc.
 Основной стек docker compose, настоящие embedding-svc и роутер не используются. Всё созданное
 (контейнеры, сеть, том, образ, если его не было до запуска) удаляется в finally.
 

@@ -177,16 +177,28 @@ docker compose up -d
 пайплайн ноутбука. Векторы разных моделей несравнимы, поэтому старые удаляются и всё
 пересчитывается заново; пока переиндексация идёт, поиск находит меньше (но не чужие векторы).
 
-1. В `main/.env` (не в git) выставить:
+**Порядок важен.** Миграция 011 возвращает документы в `pending` и переводит колонку на
+`VECTOR(768)`. Если в этот момент работает старый `ingest-worker` (`EMBEDDING_DIM=1024`, старый
+`embedding-svc` на bge-m3), он заберёт документы, получит векторы 1024 и не сможет их вставить —
+документы уйдут в `failed`. Поэтому воркер и `graph-rag-svc` останавливаются до миграции и
+запускаются только после перехода `embedding-svc` на e5. Между шагами не запускайте стек целиком
+(`docker compose up -d` без списка сервисов) и не поднимайте сервисы со старым `.env`.
+
+1. Остановить потребителей эмбеддингов:
+
+   ```bash
+   docker compose stop ingest-worker graph-rag-svc
+   ```
+2. В `main/.env` (не в git) выставить:
    `EMBEDDING_DIM=768`, `EMBEDDER_MODEL_NAME=intfloat/multilingual-e5-base`, `ROUTER_KEY=<ключ
    роутера>`; убрать `GRAPH_RAG_WITH_LOCAL_LLM` и, если Ollama не нужна, `llm` из
    `COMPOSE_PROFILES`. С прежним `EMBEDDING_DIM=1024` `graph-rag-svc` и `ingest-worker` не
    стартуют.
-2. В `services/graph-rag-svc/.env` убрать устаревшие `LLM_PROVIDER`, `OPENAI_*`, `OLLAMA_*`,
+3. В `services/graph-rag-svc/.env` убрать устаревшие `LLM_PROVIDER`, `OPENAI_*`, `OLLAMA_*`,
    `TRANSFORMERS_MODEL`, `DEVICE`, `JUDGE_MODE` и поставить `EMBEDDING_DIM=768` (образец —
    `.env.example` сервиса). Compose всё равно передаёт `EMBEDDING_DIM` и `LLM_BASE_URL` поверх
    этого файла, но лишние переменные вводят в заблуждение.
-3. Применить миграции (011 очищает `library.chunk_embeddings`, переводит колонку на `VECTOR(768)`,
+4. Применить миграции (011 очищает `library.chunk_embeddings`, переводит колонку на `VECTOR(768)`,
    создаёт таблицы быстрых ответов и ссылок и возвращает проиндексированные документы в
    `pending`; 012 — права `ingest_user` на новые таблицы):
 
@@ -196,22 +208,72 @@ docker compose up -d
        < infra/db/migrations/$m.sql
    done
    ```
-4. Пересоздать сервисы с новыми переменными: `docker compose up -d --build embedding-svc llm-proxy
-   ingest-worker graph-rag-svc db-svc`. `embedding-svc` скачает e5 и ответит `"dimension": 768`
-   на `/ping`.
-5. Дождаться, пока `ingest-worker` переиндексирует все документы:
+5. Перевести `embedding-svc` на e5 и поднять `llm-proxy`, затем убедиться, что модель новая:
+
+   ```bash
+   docker compose up -d --build embedding-svc llm-proxy
+   docker compose exec embedding-svc python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/ping').read().decode())"
+   # ждать "model": "intfloat/multilingual-e5-base", "dimension": 768 (до загрузки весов — 503)
+   ```
+6. Запустить `ingest-worker` и дождаться переиндексации всех документов:
+
+   ```bash
+   docker compose up -d --build ingest-worker
+   ```
 
    ```sql
    SELECT ingest_status, count(*) FROM library.documents GROUP BY 1;  -- ждать, пока не останется pending/processing
    SELECT embedding_model, count(*) FROM library.chunk_embeddings GROUP BY 1;
    ```
-6. Настроить `config.json` прокси (раздел 3.4): модель и адрес роутера.
-7. Загрузить быстрые ответы и ссылки через админку (`/admin/`, или напрямую с токеном):
-   `POST /api/db/library/quick-answers/import` (файл `HSE_Answers_RU.xlsx`) и
-   `POST /api/db/library/links/import` (`all_links.txt`), поле `file`. Векторы досчитает
-   `ingest-worker` (`SELECT count(*) FROM library.quick_answer_variants WHERE embedding IS NULL`).
-8. Проверить вопрос через чат или `POST /generate` в режиме `sync`. `graph-rag-svc` подхватывает
-   новые чанки сам, раз в 60 с.
+
+   Затем **отдельно проверить, что `failed` — ноль**: в первом запросе не должно быть строки
+   `failed`. Если есть, посмотреть причину и вернуть такие документы в очередь:
+
+   ```sql
+   SELECT id, title, ingest_error FROM library.documents WHERE ingest_status = 'failed';
+   UPDATE library.documents
+      SET ingest_status = 'pending', ingest_attempts = 0, ingest_next_attempt_at = NULL, ingest_error = NULL
+    WHERE ingest_status = 'failed';
+   ```
+
+   Триггер разбудит воркер; повторить проверку. SQL выполняется через `psql` из раздела 4.
+7. **Длина чанков (не проверено на корпусе).** `multilingual-e5-base` принимает не больше 512
+   токенов, а чанкер ноутбука режет до 1600 символов (плюс заголовок «Название документа /
+   Категория / Раздел»). На русском это около 3–4 символов на токен, то есть длинный чанк может
+   подойти к пределу или превысить его; всё сверх 512 токенов модель молча отбрасывает, и хвост
+   чанка в векторе не учитывается (BM25 его видит). Доля таких чанков:
+
+   ```bash
+   SQL="COPY (SELECT 'Название документа: ' || d.title || chr(10) || 'Категория: ' || d.category || chr(10) || 'Раздел: ' || coalesce(c.section_path, '') || chr(10) || 'Текст: ' || c.text FROM library.chunks c JOIN library.documents d ON d.id = c.document_id) TO STDOUT WITH (FORMAT csv)"
+   echo "$SQL" | docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -f -' \
+     | docker compose exec -T embedding-svc python -c '
+   import csv, sys
+   from transformers import AutoTokenizer
+   tok = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-base")
+   lens = [len(tok("passage: " + row[0])["input_ids"]) for row in csv.reader(sys.stdin)]
+   over = sum(n > 512 for n in lens)
+   print(f"чанков: {len(lens)}, длиннее 512 токенов: {over} ({over / max(len(lens), 1):.1%}), максимум: {max(lens, default=0)}")
+   '
+   ```
+
+   Если доля заметная, решение за владельцем: уменьшить `max_chars` в
+   `services/ingest-worker/app/notebook_chunker.py` (1600 / 1400; это расхождение с ноутбуком) и
+   переиндексировать документы.
+8. Настроить `config.json` прокси (раздел 3.4): модель и адрес роутера.
+9. Запустить `graph-rag-svc` и `db-svc` с новыми переменными:
+
+   ```bash
+   docker compose up -d --build graph-rag-svc db-svc
+   ```
+
+   `graph-rag-svc` при старте сверяет размерность (768) и строит индекс по уже
+   переиндексированным чанкам.
+10. Загрузить быстрые ответы и ссылки через админку (`/admin/`, или напрямую с токеном):
+    `POST /api/db/library/quick-answers/import` (файл `HSE_Answers_RU.xlsx`) и
+    `POST /api/db/library/links/import` (`all_links.txt`), поле `file`. Векторы досчитает
+    `ingest-worker` (`SELECT count(*) FROM library.quick_answer_variants WHERE embedding IS NULL`).
+11. Проверить вопрос через чат или `POST /generate` в режиме `sync`. Новые чанки
+    `graph-rag-svc` подхватывает сам, раз в 60 с.
 
 `graph.entities.name_embedding` остаётся `VECTOR(1024)`: GraphRAG отключён и граф не читается.
 
@@ -256,7 +318,7 @@ Grafana слушает только `127.0.0.1:3000`, пользователь `
 2. Загрузите документы через админ-панель (`/admin/`) или подключите краулер.
    `ingest-worker` подхватывает новые документы сам (LISTEN/NOTIFY), режет на чанки и считает
    эмбеддинги.
-3. Загрузите быстрые ответы (Excel) и полезные ссылки (`all_links.txt`) — шаг 7 раздела
+3. Загрузите быстрые ответы (Excel) и полезные ссылки (`all_links.txt`) — шаг 10 раздела
    «Миграция на e5». Граф строить не нужно: GraphRAG отключён.
 4. Проверьте сквозной сценарий скриптами из `tests/` (`test_flow.py`, `test_library.py`).
    `tests/test_notebook_pipeline_flow.py` проверяет путь вопроса без стека, на одноразовых

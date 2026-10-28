@@ -101,8 +101,12 @@ cli.build_graph → graph.* отключён вместе с GraphRAG.
 Проверено: модульные тесты сервисов; сборка образов `graph-rag-svc`, `ingest-worker`, `db-svc`;
 `docker compose config` для базового стека и mTLS-оверлея; сквозная проверка
 `../tests/test_notebook_pipeline_flow.py` на одноразовых контейнерах (настоящие `graph-rag-svc`,
-`llm-proxy`, Postgres со всеми миграциями; заглушки `embedding-svc` и upstream LLM). С настоящими
-моделями (e5, роутер) на живом стеке путь вопроса не прогонялся. Шаги перехода на работающем
+`llm-proxy`, Postgres со всеми миграциями; заглушки `embedding-svc` и upstream LLM). Сквозная
+проверка идёт только по HTTP (`llm-proxy:8080`, `INTERNAL_AUTH_MODE=insecure`): mTLS-путь
+(`llm-proxy:8443` с клиентским сертификатом `graph-rag-svc`) проверяется отдельно
+`../infra/mtls/tests/llm_proxy_policy.sh` и с настоящим образом `graph-rag-svc` не прогонялся;
+для mTLS-оверлея проверен только `docker compose config`. С настоящими моделями (e5, роутер) на
+живом стеке путь вопроса не прогонялся. Шаги перехода на работающем
 стенде — `../deploy.md`, «Миграция на e5».
 
 Для соседней команды изменилось содержимое ответа `/generate` (`route_used` = `quick_answer` |
@@ -141,9 +145,13 @@ cli.build_graph → graph.* отключён вместе с GraphRAG.
 1. **Конфигурация:** `EMBEDDING_DIM=768`, `EMBEDDER_MODEL_NAME=intfloat/multilingual-e5-base`,
    `ROUTER_KEY` в `main/.env`; модель и адрес роутера — в `config.json` тома `llm_proxy_config`.
 2. **Миграции** `011_notebook_pipeline.sql` и `012_notebook_grants.sql` (на свежем томе их делает
-   `init.sql`). `graph-rag-svc` и `ingest-worker` не стартуют при расхождении размерности.
-3. **Переиндексация:** перезапустить `embedding-svc` с новой моделью и дождаться, пока
-   `ingest-worker` пересчитает все документы (011 вернула их в `pending`).
+   `init.sql`) — **только после остановки** `ingest-worker` и `graph-rag-svc`: старый воркер
+   забрал бы возвращённые в `pending` документы с векторами 1024 и отправил их в `failed`.
+   `graph-rag-svc` и `ingest-worker` не стартуют при расхождении размерности.
+3. **Переиндексация:** поднять `embedding-svc` с e5, затем `ingest-worker`; дождаться, пока
+   воркер пересчитает все документы (011 вернула их в `pending`), и убедиться, что `failed` —
+   ноль. Затем запустить `graph-rag-svc`. Длина чанков относительно окна e5 в 512 токенов на
+   корпусе не проверена — проверка в `../deploy.md`.
 4. **Быстрые ответы и ссылки:** импорт `HSE_Answers_RU.xlsx` и `all_links.txt` через админку
    `db-svc`; воркер досчитает векторы.
 5. **Дёрнуть `/generate` напрямую** в режиме `sync`, минуя chat-svc: быстрый ответ, вопрос по
