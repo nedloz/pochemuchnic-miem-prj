@@ -15,9 +15,9 @@
 #   auth-svc, chat-svc ──► redis  (TCP, порт 6380, плюс ACL-пользователь на сервис)
 #   library-svc, ingest-worker (чтение), db-svc (чтение и запись) ──► minio  (порт 8443, права по CN)
 #   auth-svc ──► minio  (только бакет avatars: аватары пользователей)
-#   graph-rag-svc ──► ollama  /api/chat и т. п. (профиль llm; модель грузит ollama-init изнутри)
 #   graph-rag-svc ──► llm-proxy  POST /v1/chat/completions (порт 8443 самого llm-proxy, без сайдкара)
-#   llm-proxy ──► ollama  /v1/chat/completions (режим ollama в config.json)
+#   llm-proxy ──► ollama  /v1/chat/completions (режим ollama в config.json; профиль llm, модель
+#                грузит ollama-init изнутри)
 #
 # Подключение: после docker-compose.pki.yml (нужен step-ca и профиль pki), например
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.pki.yml:docker-compose.mtls.yml
@@ -287,7 +287,8 @@ services:
       INTERNAL_AUTH_MODE: mtls
       EMBEDDING_SVC_URL: https://embedding-svc:8443
       CHAT_WS_URL: wss://chat-svc:8443/ws/internal/llm
-      OLLAMA_URL: https://ollama:8443
+      # llm-proxy сам принимает mTLS на 8443 (сайдкара нет); пускает только CN graph-rag-svc
+      LLM_BASE_URL: https://llm-proxy:8443/v1
     volumes:
       - mtls_graph-rag-svc:/pki-svc:ro
 

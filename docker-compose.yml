@@ -10,7 +10,7 @@ services:
     profiles: ["llm"]
     # Только петлевой интерфейс, как у db-svc/graph-rag-svc/embedding-svc: у ollama нет
     # аутентификации, и наружу это открытый доступ к генерации на GPU машины. На связь между
-    # контейнерами публикация портов не влияет вовсе — graph-rag-svc ходит на
+    # контейнерами публикация портов не влияет вовсе — llm-proxy (режим ollama) ходит на
     # http://ollama:11434 внутри сети app-network, минуя хост.
     # Порт наружу не публикуется: снаружи должен быть виден только nginx.
     # ports:
@@ -48,10 +48,10 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-    # Модель берётся из OLLAMA_MODEL — той же переменной, что уходит в graph-rag-svc.
-    # Раньше здесь было зашито `ollama pull mistral`, и после смены переменной сервис просил
-    # бы модель, которую никто не скачал. $$ — экранирование от подстановки самим compose:
-    # переменная должна раскрыться внутри контейнера.
+    # Модель берётся из OLLAMA_MODEL. Она должна совпадать с ollama.model в config.json
+    # llm-proxy (режим ollama), иначе прокси попросит модель, которую никто не скачал.
+    # $$ — экранирование от подстановки самим compose: переменная должна раскрыться внутри
+    # контейнера.
     entrypoint: ["/bin/sh", "-c", "ollama pull \"$$OLLAMA_MODEL\""]
     environment:
       # OLLAMA_HOST делает CLI чистым HTTP-клиентом: загрузка идёт по сети и ложится в volume
@@ -382,10 +382,6 @@ services:
     build:
       context: ./services/graph-rag-svc
       dockerfile: Dockerfile
-      args:
-        # Ставить torch/transformers/accelerate в образ (~5 ГБ) или нет. Нужны только
-        # провайдеру LLM_PROVIDER=local, который в прод-среде использоваться не должен.
-        WITH_LOCAL_LLM: "${GRAPH_RAG_WITH_LOCAL_LLM:-false}"
     container_name: graph-rag-svc
     restart: unless-stopped
     # Порт наружу не публикуется: снаружи должен быть виден только nginx.
@@ -401,7 +397,10 @@ services:
       EMBEDDING_DIM: ${EMBEDDING_DIM}
       HF_HOME: /app/.cache/huggingface
       TRANSFORMERS_CACHE: /app/.cache/huggingface
-      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      # Все вызовы LLM (реранк, переписывание вопроса, ответ) — в llm-proxy с model "default":
+      # провайдера, модель и ключ выбирает прокси (infra/llm-proxy/README.md). С mTLS-оверлеем —
+      # https://llm-proxy:8443/v1.
+      LLM_BASE_URL: http://llm-proxy:8080/v1
     volumes:
       - graph_rag_hf_cache:/app/.cache/huggingface
       - pip_cache:/root/.cache/pip
@@ -409,6 +408,8 @@ services:
       postgres:
         condition: service_healthy
       embedding-svc:
+        condition: service_healthy
+      llm-proxy:
         condition: service_healthy
     networks:
       - app-network
