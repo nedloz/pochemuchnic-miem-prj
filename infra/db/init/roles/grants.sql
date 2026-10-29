@@ -9,7 +9,8 @@
 -- Принцип: ничего по умолчанию. Каждый сервис получает ровно то, к чему обращается его код.
 --   auth-svc     auth.* (чтение/запись), core (чтение)
 --   chat-svc     chat.* (чтение/запись), core (чтение)
---   library-svc  только чтение: topics, documents, document_files, document_relations; core
+--   library-svc  каталог: чтение topics, documents, document_files, document_relations;
+--                календарь и калькулятор: planner_*, grade_user_* (запись), grade_subject_templates (чтение); core
 --   ingest-worker документы: чтение и статусы очереди; чанки и эмбеддинги: запись;
 --                быстрые ответы и ссылки: чтение и запись только вектора; core
 --   graph-rag-svc graph.* (чтение/запись), library.* (чтение), rag.* (чтение/вставка),
@@ -118,11 +119,16 @@ BEGIN
     EXECUTE format('GRANT auth_rw, core_ro TO %I', v_auth);
     EXECUTE format('GRANT chat_rw, core_ro TO %I', v_chat);
 
-    -- library-svc: код ничего не пишет (select(...) и сырые SELECT), поэтому только чтение.
+    -- library-svc: каталог документов только читает (select(...) и сырые SELECT). Пишет лишь
+    -- пользовательские данные календаря и калькулятора; шаблоны предметов (grade_subject_templates)
+    -- наполняет парсер ПУД через админку, для сервиса они только на чтение.
     EXECUTE format('GRANT core_ro TO %I', v_library);
     EXECUTE format('GRANT USAGE ON SCHEMA library TO %I', v_library);
     EXECUTE format('GRANT SELECT ON library.topics, library.documents, library.document_files, '
                    'library.document_relations TO %I', v_library);
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON library.planner_tags, library.planner_notes, '
+                   'library.planner_note_tags, library.grade_user_templates, library.grade_user_scores TO %I', v_library);
+    EXECUTE format('GRANT SELECT ON library.grade_subject_templates TO %I', v_library);
 
     -- ingest-worker: берёт документ из очереди (SELECT ... FOR UPDATE требует UPDATE хотя бы
     -- на одну колонку), двигает его статусы, пересоздаёт чанки и эмбеддинги. Править
