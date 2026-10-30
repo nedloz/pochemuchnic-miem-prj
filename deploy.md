@@ -123,6 +123,36 @@ python3 scripts/gen_user_context_keys.py --rotate   # добавить новы�
 
 ## 4. Запуск
 
+### Обновление подтверждения почты (IVHR-54 / IVHR-55)
+
+Обновите `services/auth-svc` до версии с `app/verification.py` вместе с конфигурацией
+nginx из этого репозитория. Нужны оба изменения: шлюз публикует
+`POST /api/auth/resend-verification`, а mTLS-прокси auth-svc разрешает только сертификату
+`db-svc` вызывать `POST /internal/notifications/email-verification` с JSON `{"user_id":"UUID"}`.
+Шлюзу внутренний маршрут недоступен. Сам endpoint и вызов SMTP реализованы в auth-svc;
+новая кнопка в админке этим изменением не добавляется.
+
+В `services/auth-svc/.env` настройте `SMTP_*`, `EMAIL_FROM` и реальный публичный
+`FRONTEND_BASE_URL` (http/https, без query и fragment), при необходимости
+`EMAIL_VERIFY_RESEND_COOLDOWN_SECONDS=60`. Для шаблонов нужна уже существующая миграция
+`009_email_templates.sql`; новых миграций нет. Перезапустите auth-svc и пересоберите
+nginx; в режиме mTLS также перезапустите auth-svc-mtls для перечитывания конфигурации.
+После обновления повторная регистрация больше не меняет пароль неподтверждённого аккаунта:
+для нового письма следует использовать `/api/auth/resend-verification`.
+
+Изолированная проверка реальных nginx/mTLS-конфигов без основного стека:
+
+```bash
+python3 infra/mtls/tests/email_verification_policy.py
+```
+
+Нужны Docker, openssl и образ `nginx:1.27-alpine`; проверка создаёт временные сертификаты,
+сеть и два контейнера и удаляет их после завершения. Проверяет публичную повторную
+отправку без access-токена, удаление поддельных пользовательских заголовков, допуск db-svc
+и запрет остальных вызывающих. SMTP и приложение проверяются отдельно тестами auth-svc.
+
+### Запуск стека
+
 ```bash
 docker compose build
 docker compose up -d

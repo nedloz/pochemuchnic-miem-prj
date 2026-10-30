@@ -92,6 +92,13 @@ check(st == 200, f"login: {st}")
 check(user_context.HEADER.lower() not in hdrs and "x-user-id" not in hdrs and "x-user-role" not in hdrs,
       f"login: клиентские заголовки контекста дошли до auth-svc: {sorted(h for h in hdrs if h.startswith('x-user'))}")
 
+st, body = req("/api/auth/resend-verification", FORGED_HEADERS, method="POST")
+check(st == 200 and body.get("path") == "/auth/resend-verification",
+      f"resend-verification должен доходить до auth-svc без access-токена: {st} {body}")
+hdrs = body.get("headers", {})
+check(user_context.HEADER.lower() not in hdrs and "x-user-id" not in hdrs and "x-user-role" not in hdrs,
+      "resend-verification: клиентские заголовки контекста дошли до auth-svc")
+
 # --- админка ---------------------------------------------------------------------------------------------------------
 st, _ = req("/admin/", {"X-User-Role": "admin", "X-User-Id": ADMIN})
 check(st == 404, f"админка без сессии, но с «ролью» в заголовке: ожидался 404, получен {st}")

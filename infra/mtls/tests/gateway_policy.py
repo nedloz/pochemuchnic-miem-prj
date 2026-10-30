@@ -70,6 +70,7 @@ async def ws_open(host: str, identity: str, path: str, root: str = ROOT):
 
 A, C, L, D = "auth-svc", "chat-svc", "library-svc", "db-svc"
 PROFILE = f"/internal/users/{UUID}/profile"
+VERIFICATION = "/internal/notifications/email-verification"
 
 matrix = [
     # --- auth-svc: шлюзу публичное, но не внутреннее; chat-svc — только профиль ---
@@ -80,6 +81,7 @@ matrix = [
     (A, "nginx", "GET", "/users/me", 200),
     (A, "nginx", "PATCH", "/users/me", 200),
     (A, "nginx", "GET", PROFILE, 403),
+    (A, "nginx", "POST", VERIFICATION, 403),
     (A, "nginx", "GET", "/auth/../internal/users/%s/profile" % UUID, 403),
     (A, "nginx", "GET", "/docs", 403),
     (A, "nginx", "GET", "/openapi.json", 403),
@@ -88,6 +90,13 @@ matrix = [
     (A, "chat-svc", "GET", "/auth/validate?aud=chat-svc", 403),
     (A, "chat-svc", "GET", "/users/me", 403),
     (A, "db-svc", "GET", PROFILE, 403),
+    (A, "db-svc", "POST", VERIFICATION, 200),
+    (A, "db-svc", "GET", VERIFICATION, 403),
+    (A, "db-svc", "POST", VERIFICATION + "/other", 403),
+    (A, "db-svc", "POST", "/auth/register", 403),
+    (A, "chat-svc", "POST", VERIFICATION, 403),
+    (A, "graph-rag-svc", "POST", VERIFICATION, 403),
+    (A, "library-svc", "POST", VERIFICATION, 403),
     (A, "graph-rag-svc", "GET", PROFILE, 403),
     (A, "library-svc", "GET", "/auth/validate", 403),
     # --- library-svc: только шлюз и только его пути ---
